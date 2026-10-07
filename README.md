@@ -8,6 +8,9 @@
 ## 快速开始（新题目的 3 小时预检，成本 <50 元）
 
 ```bash
+# ⓿ P0 静态筛查（零成本，30 分钟）——项目实测「14 道题 7% 成功率，死因 100% 在选题」
+python tools/paper_screen.py --title "<论文标题>" --repo <owner/name>     --community-baseline <社区公认值> --reported-baseline <论文报告值> --delta-percent <声称增益%>     --n-benchmarks <主表benchmark数> --n-ablation <消融数> --metric-type physical
+#   → FAIL 即弃题；MANUAL 逐条按提示实查（多为零成本静态检查）
 # ① 零成本：只用论文数字做纸面预解（5 分钟）
 python tools/feasibility_gate.py --from-paper --b <论文Baseline指标> --r <论文Reference指标> --u-hint <估计地板>
 #   → 退出码 1 = 结构性不可行，直接换题，不要投算力
@@ -33,18 +36,38 @@ SKILL.md                     主入口（含 14 条执行规则，规则 11–14
 references/
   production-sop.md          完整制作与验证流程（V01–V14）+ §4.3 探针优先、§5.6 官方仓复用清单
   field-lessons.md           ★ 实战教训 L1–L9（探针优先/判定预解/指标直译/数值反推/失败诊断顺序…）
+  failure-patterns.md        ★★ 跨题目失败模式（9 条题线 + 83 条事故的提炼：六类死因过滤器、
+                                 ｜ Top5 根因、决策类错误清单、选题画像 2001 同构标准）
   gpu-budget.md              GPU 选型与预算（用实测报价、按分支期望报）
   source-policy.md           来源与口径（规范快照）
 assets/checklist.md          制作与验证检查表（复制到题目证据目录逐项填）
 scripts/gpu_budget.py        离线租价计算（用户提供报价）
 tools/
+  paper_screen.py            ★ P0 静态筛查（六类死因 + 玩具四判据 + 2001 同构，零成本 30 分钟）
   feasibility_gate.py        ★ 可行性闸门（判定门是否闭合，零 GPU）
   numeric_backsolve.py       ★ 跨规模参数数值反推（零 GPU）
   probes/                    诊断探针（从已存 rollout 算多指标，零 GPU）
   orchestrators/             自动化链（编排/回填/V09/定稿）
 cases/
-  AutoRe0566-MNO-20261007.md ★ 完整失败案例（530 元，五个方向全部证伪）
+  README.md                  ★ 跨题线失败案例集（9 个案例：1851 baseline 口径 / 1430 trivial 反超 /
+                                 ｜ 1352 混淆变量 / 1633 剂量恶化 / 2001 并发 / 2768 val 泄漏…）
+  AutoRe0566-MNO-20261007.md ★ 单题完整案例（530 元，五个方向全部证伪）
 ```
+
+## P0 零成本筛查清单（项目实测：93% 的题死在这一步）
+
+来自 9 条题线的**统计规律**——**「死因 100% 在选题」**，而判据几乎全静态：
+
+| 判据 | 工具/动作 | 拦住的真实案例 |
+|---|---|---|
+| 官方仓存在且非空壳 | `paper_screen.py`（GitHub API） | auto2027/1891/1918 |
+| 有权重 ≠ 有训练代码 | `git clone --filter=blob:none` + grep `Trainer(` | — |
+| **baseline 口径不可比** | 对照社区公认值（差值>15% 即查是否作者自跑） | **1851（差 23.8）** |
+| 判据被混淆变量污染 | 六项对比（大小/行数/长度/source/id/md5） | 1352 |
+| **trivial 基线反超** | 先跑 persistence / 最近邻 | **1430** |
+| 广度 ≥3 benchmark | 主表统计 | 体检 61 道 |
+| 增益幅度 ≥10% | 论文主图 | 2001 同构标准 |
+| 指标是物理量（U 可构造） | 排除 LLM-judge / 胜率 | 官方口径 |
 
 ## 14 条执行规则（摘要）
 
