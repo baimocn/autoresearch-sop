@@ -236,6 +236,32 @@ Compose 的 CPU 范围错误而**无法启动容器**。
 `verifier_environment_mode == "separate"`、`verifier_result.rewards` 为有限数值且与
 `reward.txt`/`reward.json` 一致、同一次 Trial 的 config/result/日志/artifacts manifest 齐备。
 
+### ★★ 语义纠偏：NOP = "Agent 不做任何操作"，**不是** "Hidden 不注入"（2026-10-09 auto0340 实录）
+
+**我最初的错解**：把 NOP 做成"**不注入 Hidden 数据** ⇒ `test.sh` 的 fail-closed 提前 `exit 2`
+⇒ 不产 reward"，并且认为"不产 reward"本身就是正确结果。
+
+**为什么错**：官方 H06 自动校验要求 `verifier_result.rewards` **与 reward 文件一致、且为有限数值**；
+**没有 reward 文件时校验器直接判"材料不完整"**（`H06 pass requires config.json, result.json, verifier/reward.*, and trial.log ...`）。
+官方口径原话是「**0 分可能是预期，也可能来自错误早退，必须结合异常、退出状态与评分日志判断**」——
+也就是说 **NOP 应当走完整条评分链路并产出一个（通常为 0 的）分数**，而不是提前退出。
+
+**正确做法**：**注入 Hidden + Agent 设 nop + 跑完整评分**。为了在有限机时内跑完，
+把单次预算压小、让评分器自己降级（实测 `VG_RUN_TIMEOUT=1500 VG_EVAL_EPISODES=2`
+⇒ 内部 `plan_budget()` 把 100000 步自动缩到 3397 步，**并把降级写进 `reward.json::degradations`**，不静默改协议）。
+实测结果：`Agent rc=0 / Verifier rc=0 / reward.txt=-0.000234`，四件套齐、判定 PASS。
+
+⇒ **判据：NOP 里若"没有 reward 文件"，先怀疑是自己的 fail-closed 太靠前，而不是"这就是预期"。**
+
+### ★★ reward 产物的命名与格式契约（同一次实录，可与 L12 对照）
+
+| 约束 | 实测症状 / 做法 |
+|---|---|
+| `verifier/reward.txt` 必须是**单个数值** | 写 `NOT_PRODUCED` 之类字符串 ⇒ 校验器 `float()` 直接抛 `reward.txt must contain a single numeric value` |
+| **评分产物不要占用 `verifier/reward.json` 这个名字** | 校验器优先读 `reward.json` 并当作"数值 map"解析；而评分产物是嵌套结构（`per_seed`/`degradations`/`anchors`）⇒ 报 `reward must be a nonempty numeric map with finite values, not status strings/bools`。**改名为 `reward_full.json`** 即可两全 |
+| `config.json` 的 `agent.name` 与 `result.json` 的 `agent_info.name` 必须一致 | 不一致直接判失败（`H06 requires consistent config/result Agent names`） |
+| 证据必须**同目录、同一次 Trial** | `config.json` + `result.json` + `verifier/reward.*` + `trial.log`（或 `verifier/test-stdout.txt`）缺一不可 |
+
 ## L12 ★★★ 质检 Skill 的契约字段必须一次性对齐（21 次报错的教训）
 
 > 来源：auto2768 质检轮。同一份 review.json 撞了 **21 次 `inspection_error`**、13 种不同错误。
@@ -722,8 +748,9 @@ git config core.eol lf
 因此完全不受行尾状态影响：
 
 ```bash
-# 1) 用 gh api 取远端最新内容（拿到的就是 LF 版本）
-gh api "repos/<owner>/<repo>/contents/<path>?ref=master" --jq '.content' | base64 -d > <path>
+# 1) 用 gh api 取远端最新内容（★ 实测拿到的仍是 CRLF，见本节末"更正"）
+gh api "repos/<owner>/<repo>/contents/<path>?ref=master" --jq '.content' | base64 -d \
+  | tr -d '\r' > <path>          # 显式归一化，否则会把 CRLF 再推回去
 # 2) 在本地把新内容合并进这份"远端最新版"
 # 3) 用 API 工具提交（内部是 base_tree + compare-and-swap，并发安全）
 python tools/push_via_api.py --repo <owner>/<repo> --branch master     --message-file msg.txt --verify <files...>
@@ -746,6 +773,236 @@ python tools/push_via_api.py --repo <owner>/<repo> --branch master     --message
 2. **编辑器/工具写文件时必须写 LF**（与 L8 表格里"生成脚本的 CRLF"同源纪律，
    但那条讲的是"脚本跑不动"，本条讲的是"版本控制被污染"）。
 
+### ★ 更正（2026-10-09，实测）
+
+上节修法 B 第 1 步写「用 gh api 取远端最新内容（**拿到的就是 LF 版本**）」——
+**这句是错的**。实测本仓库远端 blob 本身就是 CRLF：
+
+```
+$ gh api "repos/<owner>/<repo>/contents/SKILL.md?ref=master" --jq '.content' | base64 -d | tr -cd '\r' | wc -c
+89
+$ gh api "repos/<owner>/<repo>/contents/references/field-lessons.md?ref=master" --jq '.content' | base64 -d | tr -cd '\r' | wc -c
+771
+```
+
+**根因**：本仓库的提交走 Git Data API（`tools/push_via_api.py`），**绕过了 git 的
+`core.autocrlf` / `.gitattributes` 归一化** ⇒ 谁写进去什么字节，远端就存什么字节。
+近期几次回流把 CRLF 原样推了上去，于是 `.gitattributes(eol=lf)` 与实际内容**不一致**。
+
+⇒ **取回后必须显式归一化**，否则会把 CRLF 再推回去：
+
+```bash
+gh api "repos/<owner>/<repo>/contents/<path>?ref=master" --jq '.content' \
+  | base64 -d | tr -d '\r' > <path>
+```
+
+**提交前自查本仓库的行尾混杂情况**（0=LF 干净，>0=CRLF）：
+
+```bash
+for f in $(git ls-files '*.md' '*.py'); do
+  n=$(git show "origin/master:$f" | tr -cd '\r' | wc -c)
+  [ "$n" -gt 0 ] && printf "%-46s CR=%s\n" "$f" "$n"
+done
+```
+
+---
+
+## L24 ★★★ 交付包"静态检查全绿、真机必挂"的三类结构性缺陷（2026-10-09 auto0340 实录）
+
+> 来源：auto0340（IQ-MPC / TD-MPC2 离线 RL）NOP Trial 真机构建轮。
+> 这三类缺陷**全部通过了 `docker_paths.inspect()` 与自写包检查器**，
+> 只有真机 `docker build` 才暴露；一次 NOP Trial 把它们全部抓出。
+> 这是"静态通过 ≠ 可运行"最贵的一次实证。
+
+### 24.1 Dockerfile 行尾双反斜杠 ⇒ 整个镜像建不出来
+
+**症状（原文照抄）**：
+```
+ERROR: failed to solve: dockerfile parse error on line 31: unknown instruction: -e
+```
+
+**根因**：行尾写成了 `\\`（**两个反斜杠**）。Dockerfile 里行尾 `\` 是续行符，
+而 `\\` 是"转义后的字面反斜杠" ⇒ **不续行** ⇒ 下一行 `-e 's|...|...|g'` 被当成一条独立指令，
+Docker 拿它当指令名解析，报 `unknown instruction: -e`。
+
+**字节级判据（不要用 `grep $'\r'`，那是假阳性）**：
+```bash
+# 行尾"双反斜杠 + LF"计数，必须为 0；92='\'，10=LF
+python3 -c "
+raw = open('tests/Dockerfile','rb').read()
+print('行尾双反斜杠 =', raw.count(bytes([92,92,10])))"
+```
+
+**修法**：`\\`+LF → `\`+LF，并固化成构建前置断言
+（`check_dockerfile_gate.py`：CR=0 / 行尾双反斜杠=0 / `FROM` 含期望基础镜像）。
+
+**★ 我自己的误判（比原缺陷更贵）**：先用 `grep -c $'\r'` 数行尾，报 CR=41/39，
+据此判成"CRLF 污染"，**方向完全错**；用 `tr -cd '\r' | wc -c` 实测 CR=**0**。
+⇒ **字节属性一律用 `tr`/Python 数，禁用 `grep $'\r'`**（Git Bash 下会把 `\r` 当正则，产生假阳性）。
+
+### 24.2 基础镜像的 Python 版本与依赖闭包不匹配
+
+**症状**：容器内 `apt-cache policy python3.9` → **`Candidate: (none)`**；`python3.9-dev` 查询为空。
+
+**根因**：Dockerfile 用 `ubuntu:22.04`，而 22.04 官方源只有 `python3.10`；
+requirements 钉 `torch==2.2.2+cu118` + `numpy==1.23.5`，**两者都要求 Python < 3.10**。
+⇒ **组合自相矛盾，按包内 Dockerfile 构建必失败，正式评分同样失败**。
+
+**判据（构建前一条命令，零成本）**：
+```bash
+docker run --rm ubuntu:22.04 bash -c 'apt-get update -qq && apt-cache policy python3.9 | head -3'
+# 出现 Candidate: (none) ⇒ 立刻换基础镜像
+```
+
+**修法**：换 `ubuntu:20.04` + deadsnakes（或直接用自带目标 Python 的官方镜像）。
+**教训**：基础镜像的"发行版年份"必须与"Python 版本 / 依赖闭包"一起选，不能只看 OS 顺手。
+
+### 24.3 pip 依赖解析冲突：本地 `--no-deps` 绕过**从未回写交付包**
+
+**症状（原文照抄）**：
+```
+ERROR: Cannot install -r /tmp/requirements.txt (line 27) and torch==2.2.2+cu118
+  The user requested torch==2.2.2+cu118
+  torchrl 0.6.0 depends on torch>=2.5.0
+ERROR: ResolutionImpossible
+```
+
+**根因（两层，第二层才是真问题）**：
+1. `torchrl==0.6.0` 的 METADATA 声明 `torch>=2.5.0`，与题面钉死的 `torch==2.2.2+cu118` 冲突
+   ⇒ pip 全量解析直接拒绝；
+2. **为什么一直没发现**：本地为绕过它生成了一个 `--no-deps` 的 Dockerfile **变体**，
+   用它构建"成功"过 —— **但那个变体从未回写进交付包**。包里始终是**未经真机验证的原写法**。
+
+**运行时真相**：torch 2.2.2 + torchrl 0.6.0 在采集机上实跑 12h 正常出分
+⇒ 属**上游 METADATA 过严**，不是真实不兼容。
+
+**修法（可复制）**：把冲突包从全量解析里摘出来单独 `--no-deps` 装，并在构建期自检：
+```dockerfile
+RUN grep -vE '^(torchrl|tensordict)==' /tmp/requirements.txt > /tmp/req_core.txt \
+ && pip install --no-cache-dir -r /tmp/req_core.txt \
+ && pip install --no-cache-dir --no-deps "torchrl==0.6.0" "tensordict==0.6.0" \
+ && python3 -c "import torch, torchrl, tensordict; print('deps OK')"
+```
+
+**★ `--no-deps` 的两笔债，必须显式偿还**：
+1. **绕过没回写**：本地变体建成功 ≠ 交付包能建。**任何本地绕过都必须回写进交付件**，否则等于没修。
+2. **运行时依赖被跳过**：实测 `tensordict` 缺 `orjson`，评分脚本在 import 阶段直接崩：
+   ```
+   File "tensordict/_lazy.py", line 33, in <module>
+     import orjson as json
+   ModuleNotFoundError: No module named 'orjson'
+   ```
+   **修法**：用 `pip show <pkg>` 的 `Requires` 字段列全依赖，逐个显式钉版本写进 requirements
+   （实测需补 `orjson` / `cloudpickle` / `packaging`，且**要与离线 wheel 源里实际存在的版本对齐**，
+   否则离线构建又挂）。
+
+### 24.4 为什么静态检查器抓不到（元教训）
+
+| 检查器 | 看什么 | 对上述三类 |
+|---|---|---|
+| `docker_paths.inspect()` | COPY 源、路径契约、profile | ❌ 全 PASS（不解析 Dockerfile 指令语义，也不跑 pip） |
+| 自写包检查器（文件数/大小/JSON 可解析） | 结构与完整性 | ❌ 全 PASS |
+| **真机 `docker build` + 跑一次评分链路** | 指令解析、apt 源真实内容、pip 依赖图 | ✅ 三类全暴露 |
+
+⇒ **纪律：交付前必须在真机（或可丢弃环境）完成一次完整构建 + 一次评分链路实跑。**
+静态检查全绿**不构成**"可构建"的证据。这也是 NOP Trial 不可替代的实证理由。
+
+---
+
+## L25 ★★★ 工作区由 `starter/` 复制而来 ⇒ hard_gate 必需件必须在 starter 内（2026-10-09 auto0340 实录）
+
+**症状（原文照抄）**：
+```
+[hard-gate] FAIL [G5] 缺少 submission.json
+[verify] HARD-GATE 违规（rc=1），reward 记为 -1
+__EXIT__=4
+```
+
+**根因**：`environment/Dockerfile` 的工作区是用
+`RUN cp -a /workspace/starter/. /workspace/solution/` **从 starter 复制**出来的；
+而 `submission.json` 只存在于**源码层** `solution/`，**没有进 `starter/`**。
+但 `tests/hard_gate.py` 的 G5 要求"必须能解析出 submission.json"。
+
+⇒ **后果是这一类里最严重的**：**任何 Agent 提交都会被判违规** ——
+"不改就交"和"改了再交"**两种死法**，reward 恒为 −1，整道题的评分链路彻底不可用。
+
+**为什么静态检查看不见**：源码树里 `solution/submission.json` **确实存在**，
+检查器看的是源码树，**不看镜像内复制后的实际布局**。
+
+**判据（构建后一条命令）**：
+```bash
+docker run --rm --entrypoint /bin/bash <agent-img> -lc 'ls -la /workspace/solution/'
+# 必须与 hard_gate / test.sh 的必需件清单逐项对齐
+```
+
+**修法**：把占位 `submission.json` **纳入 `starter/`**（与 `solution/` 内容一致、md5 相同）。
+
+**★ 推广（真正可复用的部分）**：
+> 只要工作区是"从某个只读模板复制"而来，**该题所有 hard_gate / 入口脚本要求的必需件，
+> 都必须存在于那个模板里**。构建后立刻用一条 `ls` 对照必需件清单，不要等 NOP 才发现。
+
+---
+
+## L26 ★★ 远端取回证据的静默失败：`o.read()` 返回空串 ≠ 文件为空（2026-10-09 auto0340 实录）
+
+**症状**：用 paramiko 批量取回远端台账，**写出了 12 个 0 字节文件，全程没有任何报错**。
+
+**根因**：同一 `exec_command` 通道在循环里**逐次 `o.read()`** 时，
+后续读取会**静默返回空串**（通道已耗尽），而不是抛异常。
+
+**判据**：取回后**必须校验字节数**，不能只看"命令退出码 0"：
+```python
+assert raw, f"{name} 取回 0 字节"      # 空串即失败
+```
+
+**修法（可靠做法）**：一次 exec 输出「分隔符 + `base64 -w0`」，**一次性读完**再本地切分：
+```bash
+# 远端
+for f in $FILES; do echo "### FILE $f"; base64 -w0 "$f"; echo; done
+```
+```python
+raw = stdout.read()                     # 只读一次
+for chunk in raw.split("### FILE ")[1:]: ...
+```
+
+**连带三个坑（同一次踩全）**：
+1. 同一连接上「`exec_command` 读管道」与「`sftp.get`」**混用** ⇒ 通道状态错乱，
+   `sftp.get` 报 `No such file`（**文件其实存在**，`stat` 正常）。
+2. Windows 上 `os.path.join(dst, 远端全路径)` 会造非法目录 ⇒ 只取 `os.path.basename`。
+3. **时效性证据要先落盘再分析**：机器随时可能释放，顺序反了就有永久丢失风险。
+
+---
+
+## L27 ★★ 改动/产出"用户要交出去的东西"时的两条纪律（2026-10-09 auto0340 实录）
+
+### 27.1 先确认**目标载体形态**，不要自己发明格式
+
+**症状**：把"填表用的自检结论"写成了 Markdown 文档，用户原话：
+> 「这俩是表格的文字描述填写，你的输出让我咋填」
+
+**根因**：按"文档"的默认习惯输出，**没有确认这份东西最终要放进哪里**。
+
+**纪律**：产出任何"要填进某个表 / 交给某个角色"的材料前，先问清载体：
+**表格列号 / 纯文本（含行尾） / Word / JSON**；有官方模板就**严格按模板版式**输出
+（段号、`[OK]/[FAIL]/[NEED]/[OPEN]` 标记、`SUMMARY` 统计块），**不要自己发明结构**。
+
+### 27.2 改动分类：**"修文字"可自主，"改判断"必须先问**
+
+**症状**：用户质问「你凭啥越权审」。回看，我改的是**性质完全不同的两类**东西：
+
+| 类别 | 例子 | 可否自主 |
+|---|---|---|
+| **修文字** | 删草稿残留（"…算子学习**一句话**"）、去重复串（`reload.log、reload.log`）、修语句不通 | ✅ 可自主（不改变事实与结论） |
+| **改判断** | 把自检结论 `[ OK ]` 改成 `[FAIL]`；把"U **未定**"改成"U **已定 = X**" | ❌ **必须先问** |
+
+**根因**：把"证据很足"当成了"我有权改"。但**"我认为是笔误" ≠ "我有权替用户给他的结论定性"**。
+
+**★ 最硬的信号**：当子代理/他人明确写出「**因涉及你的结论定性，未擅自改**」或
+「**改法取决于你是否采纳，需你定夺**」时，**那句话就是我不能碰的地方**；
+把它当"待办"顺手做掉，就是越权。
+
+**纪律**：改动**用户署名/提交**的产物前先分类 —— **改判断 ⇒ 只报告 + 给建议改法，等确认**。
+
 ---
 
 ## 快速检查清单（P0/P1 阶段强制过）
@@ -757,6 +1014,7 @@ python tools/push_via_api.py --repo <owner>/<repo> --branch master     --message
 - [ ] 失败诊断按"指标 → 判定 → 标定 → 容量 → 换题"顺序走吗？（L5）
 - [ ] 资产与数据集**解耦**了吗（换题只需 1–2 天）？（L7）
 - [ ] 跑 NOP 前实测过 GPU/buildx/compose/容量/网络**五项前提**吗？（L11）
+- [ ] NOP 是"Agent 不操作 + Hidden 正常注入 + 跑完整评分"吗？（**不是**"Hidden 不注入 ⇒ 提前退出"，L11）
 - [ ] 交付字节与运行绑定哈希**交叉验证过**逐文件一致吗？（L13）
 - [ ] 同一事实（锚点/口径/U）在包内**只有一套生效声明**吗？变更有披露吗？（L14）
 - [ ] 写 review.json 前**一次性列全**校验器字段约束了吗？（L12）
@@ -769,3 +1027,9 @@ python tools/push_via_api.py --repo <owner>/<repo> --branch master     --message
 - [ ] 改过被质检锚定的交付物吗？改了就**上报重检**，别自查通过（L20）
 - [ ] 结构化表格是人工改的、还是库回写的？回写后做过**全表 diff 断言**吗？（L22）
 - [ ] 要执行候选代码时，隔离沙盒建不起来**判基础设施故障**且**不回落宿主**吗？构建期做了 fail-closed 自检吗？（见 [隔离执行沙盒](references/sandbox-isolation.md)）
+- [ ] 交付前在真机完成过一次**完整构建 + 评分链路实跑**吗？（静态全绿 ≠ 可构建，L24）
+- [ ] Dockerfile 的行尾有 `\\`（双反斜杠）吗？基础镜像的 Python 版本与 torch/依赖闭包匹配吗？（L24.1/L24.2）
+- [ ] 用过 `--no-deps` 吗？**本地绕过回写交付件了吗**？它跳过的运行时依赖补齐了吗？（L24.3）
+- [ ] 工作区是从 `starter/` 复制的吗？hard_gate 必需件**都在 starter 里**吗？（L25）
+- [ ] 远端取回的证据**校验过字节数**吗？（空串 ≠ 空文件，L26）
+- [ ] 要改的是"文字"还是"判断"？改判断先问；产出填表件先确认**载体形态**（L27）

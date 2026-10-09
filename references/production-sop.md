@@ -344,6 +344,34 @@ docker build -t task-verifier:local -f workspace/harbor_task/tests/Dockerfile wo
 
 **证据**：两侧 build/start 日志、退出码、镜像标识与实际依赖版本。
 
+**补充（2026-10-09 auto0340 实测；三类缺陷静态检查器全 PASS，只有真机构建才暴露 —— 见 L24/L25）**：
+
+1. **构建前跑 Dockerfile 前置断言**：CR=0、**行尾双反斜杠=0**、`FROM` 行含期望基础镜像。
+   行尾 `\\` 会让下一行被当成独立指令 ⇒ `dockerfile parse error ... unknown instruction: -e`，镜像根本建不出来。
+   ```bash
+   python3 -c "raw=open('tests/Dockerfile','rb').read(); print(raw.count(bytes([92,92,10])))"   # 必须 0
+   ```
+   ⚠️ **不要用 `grep -c $'\r'` 数行尾**（Git Bash 下是假阳性）；一律用 `tr -cd '\r' | wc -c` 或 Python 数字节。
+2. **基础镜像的 Python 版本必须与依赖闭包匹配**（构建前一条命令即可判定）：
+   ```bash
+   docker run --rm ubuntu:22.04 bash -c 'apt-get update -qq && apt-cache policy python3.9 | head -3'
+   ```
+   实测 22.04 返回 `Candidate: (none)`（源里只有 `python3.10`），而 `torch==2.2.2+cu118` + `numpy==1.23.5`
+   要求 Python < 3.10 ⇒ **组合自相矛盾，构建必挂、正式评分同样挂**。换 20.04 + deadsnakes。
+3. **构建期加 import 自检**，比事后排查便宜得多：
+   ```dockerfile
+   RUN python3 -c "import torch, torchrl, tensordict, gym, dm_control; print('imports OK')"
+   ```
+4. **用了 `--no-deps` 就必须显式偿债**：它会把该包的依赖一起跳过（实测 `tensordict` 缺 `orjson`
+   ⇒ 评分脚本 import 阶段即崩）。用 `pip show <pkg>` 的 `Requires` 字段列全依赖并钉版本，
+   且要与离线 wheel 源中**实际存在的版本**对齐。**本地 `--no-deps` 变体必须回写进交付件**。
+5. **构建后对照 hard_gate / 入口的必需件清单**：工作区由 `starter/` 复制而来时，
+   必需件必须存在于 `starter/`，否则**任何提交都被判违规**（实测 `[hard-gate] FAIL [G5] 缺少 submission.json`，
+   reward 恒 −1）：
+   ```bash
+   docker run --rm --entrypoint /bin/bash <agent-img> -lc 'ls -la /workspace/solution/'
+   ```
+
 ### V03：Public/Dev 反馈闭环
 
 **操作**：在全新 Agent 容器用未修改 Starter/正式 Baseline 调用题面公开命令；小样本 smoke 仅测接口，随后用正式 Dev 协议出分。进行一次合法方法变更，确认评分确实执行新版本并给出可用于下一轮的反馈。

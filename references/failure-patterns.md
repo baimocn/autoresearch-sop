@@ -108,6 +108,8 @@
 | 链死无人知 | 1633（GPU 空转）、2001（harness 死 47min） | 发射五步探测 + 巡检脚本；输出**永不 `>/dev/null`** |
 | 时限/预算耗尽 | 0340（0.81h vs 官方要 10h）、TAWM（≈37 实例小时） | 时间账乘失败系数；**单次出分 ≤2h 硬线优先选题** |
 | **val/Hidden 泄漏** | 2768（r28 起用干净 val 标签当训练种子 → r31 分数跳到 99.9） | 泄漏检查进 smoke；Hidden 缺失 fail-closed |
+| **工作区缺 hard_gate 必需件** | 0340（`starter/` 无 `submission.json` ⇒ 任何提交被判 G5 违规、reward 恒 −1） | 必需件必须在 starter 派生面内；构建后 `ls` 对照清单（L25） |
+| **静态全绿但真机必挂** | 0340（Dockerfile 行尾 `\\` ⇒ `unknown instruction: -e`；`ubuntu:22.04` 装不出 py3.9；`torchrl 0.6.0` 要 torch≥2.5 与钉死的 2.2.2 冲突） | 真机联网构建一次 + 跑评分链路；**本地绕过必须回写交付件**（L24） |
 
 ## 七、流程漏洞（需制度补）
 
