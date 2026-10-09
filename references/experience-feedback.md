@@ -140,6 +140,72 @@ python tools/push_via_api.py --repo baimocn/autoresearch-sop --branch master \
 
 ---
 
+---
+
+## 四、可以同时发给多个会话吗？
+
+**可以，但必须遵守三条纪律**，否则会**静默丢数据**（不报错，内容却没了）。
+
+### 为什么危险
+
+提交流程是 `读 head → 建树 → 提交 → 更新引用`，这是典型的 read-modify-write。
+两个会话同时跑时，双方可能读到**同一个 head**，各自基于同一个 `base_tree` 建树：
+
+```
+会话A: 读 head=H ──> 建树(含A) ──> 提交CA ──> 引用指向CA     ✓
+会话B:      读 head=H ────────────> 建树(含B,不含A) ──> 提交CB ──> 引用指向CB
+                                                                  ↑
+                                          结果：A 的改动被 B 的树整体回退
+```
+
+从提交图上看是"B 接在 A 后面"，但 **B 的树里没有 A 的文件**——A 的改动消失了。
+
+### 三条纪律
+
+| # | 纪律 | 原因 |
+|---|---|---|
+| 1 | **用 CAS 版本的工具**（本仓库的 `push_via_api.py` 已内置 compare-and-swap 重试） | 引用更新失败会自动重新读取 head 与 base_tree 再试，不同文件的改动不会互相覆盖 |
+| 2 | **各会话改不同文件 / 不同段落** | CAS 只能保证"不同文件不丢"。两个会话若都往 `field-lessons.md` 追加"下一条 Lxx"，后提交者仍会覆盖前者——这是**语义冲突**，工具层面无解 |
+| 3 | **提交后回读查重** | 用 `--show <path>` 拉最新内容，确认自己的条目在、且编号没和别人撞 |
+
+### 推荐做法：让各会话写独立文件
+
+最稳的方式是**一个会话一个文件**，避免共享文件的追加冲突：
+
+```
+references/cases/<题号或日期>-<主题>.md      ← 各会话各写各的
+```
+
+若确实要追加到共享文件（如 `field-lessons.md`），按此顺序：
+
+```bash
+# 1) 先拉最新，看当前最大编号
+python tools/push_via_api.py --repo baimocn/autoresearch-sop --branch master     --show references/field-lessons.md | grep -E "^## L[0-9]+" | tail -5
+
+# 2) 基于最新编号写自己的条目（不要凭记忆写编号）
+
+# 3) 提交（CAS 自动处理并发；失败会自动重试）
+python tools/push_via_api.py ... --verify <文件>
+
+# 4) 回读，确认自己的条目在、编号没撞
+python tools/push_via_api.py ... --show references/field-lessons.md | grep -E "^## L[0-9]+" | tail -5
+```
+
+### 并发能力边界（如实说明）
+
+| 场景 | 是否安全 |
+|---|---|
+| 两个会话推**完全不同的文件** | 安全（CAS 保证） |
+| 两个会话推**同一文件的不同段落** | 大概率安全，但需回读确认 |
+| 两个会话追加**同一文件的同一位置**（如都续写 L17） | **不安全** —— 后写者覆盖前者，必须靠人工定编号 + 回读查重 |
+| 两个会话**同一秒**提交 | 安全 —— 后者引用更新失败后自动重试 |
+
+### 提升并发成功率的做法
+
+- 把 `--retries` 调大（默认 5；并发会话多时用 10）
+- 各会话**不要同时提交**：可在提示词里约定错开（如按题号奇偶分批）
+- 提交信息里带上**会话/题目标识**（如 `[auto2768]`），便于冲突时定位
+
 ## 三、自举验证记录（本文件如何被推送）
 
 本文件与 `tools/push_via_api.py` 是**同一批产物**，且用后者推送到远端：
@@ -150,3 +216,22 @@ python tools/push_via_api.py --repo baimocn/autoresearch-sop --branch master \
 
 这构成一次**自举**：工具把它自己和它自己的使用说明推了上去。
 若你在远端读到本文件，说明这条通道是可用的。
+
+并发安全（CAS，compare-and-swap 重试）经**真实并发实测**：
+同时启动两个进程推不同文件，验证两者均落地、无静默回退。
+测试方法见下方"验证 CAS 是否生效"。
+
+
+### 验证 CAS 是否生效（可自行复现）
+
+```bash
+# 制造并发：两进程同时推不同文件
+python tools/push_via_api.py --repo <owner/name> --branch master     --message "concurrent A" --verify <fileA> &
+python tools/push_via_api.py --repo <owner/name> --branch master     --message "concurrent B" --verify <fileB> &
+wait
+# 期望：两个文件都在远端；若某个进程输出"引用已被他人前移，重新读取基线"，
+#       说明 CAS 生效并自动重试成功。
+```
+
+**注意**：若两个进程恰好完全错开（未撞上），本次不会触发重试，这不代表 CAS 无效。
+要强制触发，可用 `--assume-head <过期的 SHA>` 复现冲突路径。
