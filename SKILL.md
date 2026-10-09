@@ -58,6 +58,10 @@ metadata:
 27. **工作区由模板复制 ⇒ hard_gate 必需件必须在模板内**（源自实战，见 L25）：工作区若由 `starter/` 复制而来，所有入口/hard_gate 要求的必需件都必须存在于 `starter/`；否则**任何提交都被判违规**（reward 恒为 −1，评分链路不可用）。构建后一条 `ls` 对照必需件清单。
 28. **取回证据必须校验字节数**（源自实战，见 L26）：远端/管道读取可能**静默返回空串**（实测写出 12 个 0 字节"证据"而无报错）。空串即失败；时效性证据先落盘再分析。
 29. **改动用户交付物前先分类**（源自实战，见 L27）：**"修文字"（删错别字/去重复/修语句）可自主；"改判断"（改结论/定性/口径）必须先问**；他人写明"需你定夺"处即不可碰。产出填表/交材料件前先确认**目标载体形态**（表格列号/纯文本/Word），按官方模板版式输出。
+30. **宣布"某类方法全部失败"前必须先枚举-勾选**（源自实战，见 [L28](references/field-lessons.md)）：把候选空间目录下的**全部**可用配置列出来（如 `ls config/acquisition/*.yaml`），逐条标注 `已测(结果)` / `未测` / `不可用(原因)`；**只要还有"未测"，就不允许写"某类方法全部失败"**。这条差点把一道可做题判成不可行——6 次实验全负后绕过了三个未测配置，补测才发现其中 `lcmd` 是唯一优于随机的（−10.5%）。
+31. **从训练日志取"官方指标"必须按评测调用点去重**（源自实战，见 [L29](references/field-lessons.md)）：同一个 `time_step_name` 可能对应**两次不同口径**的评测（如 `al/` 官方 val 与 `al_new_data/` 新数据），且日志行形状相同、`prefix` 不落 stdout。**官方口径 = 每个迭代的第一次评测**（末轮常因 `if not last` 只剩一次）。用"按迭代分组取首个"而非 `tail -1`；并用 V09 独立重载（只喂 val）**交叉验证一次口径**——取错不报错，会静默污染全部对照。
+32. **依赖仓库自带配置前，先让它跑出一次退出码 0**（源自实战，见 [L30](references/field-lessons.md)）：仓库里"存在、有注释、被文档引用"的配置可能**从未端到端跑过**。实测两个：`ufull.yaml`（每轮加 0 个点 ⇒ `torch.cat` 空列表 ⇒ `RuntimeError`）与 `coreset_maxdist`（latent 分支 `TypeError`）。判据：`--cfg job --resolve` 合成成功后，再用**最小规模**（epochs=1~2、iter=1、池调小）真跑一遍，确认关键阶段痕迹与退出码。**注释描述的是作者意图，不是实际行为；注释不算证据。**
+33. **`subprocess(text=True)` 必须同写 `encoding="utf-8"` + `errors`**（源自实战，见 [L31](references/field-lessons.md)）：`text=True` 只开文本模式，编码取 `locale.getpreferredencoding()`（Windows 实测 `cp936`），用它解 `gh` 等工具的 UTF-8 输出会抛 `UnicodeDecodeError`，**该异常若被吞掉就会把"编码 bug"误报成"凭据/网络不通"**。自查：`grep -rn "text=True" --include=*.py tools/ scripts/ | grep -v encoding=`。配套纪律：**自检失败分支必须打印原始异常**，不许只说"某某不通"。
 
 没有真实结果时填写 `NOT_RUN`/null；全部正式要求满足才写 COMPLETE/true。格式错误、非作弊 Hard Gate、超时、资源超限、基础设施故障分开标记；Hard Gate=-1 不参与正常排序。合法负分用状态区分。泄露标签或评分写权限失守须返修隔离。
 
@@ -80,6 +84,7 @@ metadata:
 - **经验回流**：一道题做完/返修完，把可复用经验回流到统一 SOP 仓库。判据是"换一道完全不同的题，这条经验还有效吗？"；明确禁止回流一次性操作、常识、只对本题成立的结论与任何私有材料。提示词（可整段复制给任意题目会话）与提交通道见 [经验回流](references/experience-feedback.md)。
 - 使用 `tools/harbor_task_contract.py` 做 **task.toml 原生契约预检**（只读、零成本；本机装了目标 Harbor 时会**真加载** TaskConfig，否则走内置判据）：`[task].name` / `network_mode` 枚举 / `[verifier].environment_mode` / `build_timeout_sec`；退出码 0=通过 / 1=原生必挂 / 2=需人工确认。
 - 使用 `tools/nop_preflight.py` 做原生 NOP Trial 的**环境前置预检**：逐项实测 GPU 直通（并识别 snap Docker 只读命名空间等结构性失败）、nvidia runtime、buildx、compose v2、宿主容量与题面声明的落差，给出修法；退出码 0=就绪 / 1=硬前提不满足（不要开跑）/ 2=需人工确认。只读，不启动 Trial、不训练、不读私有标签。
+- 使用 `tools/candidate_surface_audit.py` 做 **候选改动空间的「枚举-勾选」审计**（只读、零成本）：`--surface <dir> --pattern '*.yaml'` 列出磁盘上全部候选；配合 `--declared-inline`/`--declared` 给出已测声明，工具报出**未声明候选**（即「未测就被算进全败」的风险点）；`--check-phantom` 反向核对虚报。退出码 0=覆盖完整 / 1=有未覆盖（硬失败）/ 2=信息不足。**宣布某类方法「全部失败」前必须先过此门**（见 L28/E84）。
 - 使用 `tools/dockerfile_preflight.py` 做 **Dockerfile 构建前静态预检**（只读、零成本）：行尾双反斜杠（`unknown instruction: -e` 的真根因）/ 基础镜像 Python 版本与要装的版本是否匹配（`ubuntu:22.04` 装不出 `python3.9`）/ `--no-deps` 的债务提醒（须补运行时依赖 + 构建期 import 自检）；退出码 0=通过 / 1=硬失败（按现有内容构建必挂）/ 2=需人工确认。**它不能替代真机构建**，只把最贵的几类提前拦下。
 - 本技能不绑定某台机器或项目绝对路径，不内置原项目的大附件、模型或整套质检代码。
 - 需要项目正式 QA 时，先定位当前平台提供的 `autoresearch-task-qa`，读取其 SKILL/规则并核对入口 `--help`。来源附件的 `audit_task.py` 不支持 `--review`，`implementation_review.py` 才支持；新版本据实选择。找不到 Skill 时可按内置 SOP 做人工检查，并明确“未执行平台机检”，不能伪造报告。

@@ -57,6 +57,8 @@ base_tree 并重建整棵树；引用更新失败（他人已前移）即退避�
 """
 
 import argparse
+import re
+import os
 import base64
 import hashlib
 import json
@@ -101,7 +103,8 @@ def gh(method, path, body=None, timeout=180):
 
 def check_env(repo):
     """环境自检：gh 是否登录 + api.github.com 是否可达 + 仓库是否可见。"""
-    p = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    p = subprocess.run(["gh", "auth", "status"], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
     blob = (p.stdout or "") + (p.stderr or "")
     if p.returncode != 0 or "Logged in" not in blob:
         print("  !! gh 未登录或凭据失效 —— 请先 `gh auth login`")
@@ -142,6 +145,36 @@ def show_remote(repo, branch, path):
     return EXIT_OK
 
 
+def to_repo_paths(files, repo_root):
+    """把传入的文件路径换算成【仓库相对路径】（posix），并校验都在 repo_root 内。
+
+    来源：2026-10-07 事故（field-lessons L32）。原实现直接用 Path(f).as_posix()
+    作为 git tree 的 entry path；在 Windows 上传绝对路径（D:/.../SKILL.md）时，
+    git 会把 "D:" 当成一个目录名，建出幽灵子树 D:/Desktop/.../SKILL.md，
+    而真正的 SKILL.md 落回 base_tree 的旧 blob —— 提交"成功"但内容没变。
+    """
+    if repo_root is None:
+        # 未显式给出：尝试从当前工作目录推断；推断不出则退回"按给定名相对化"
+        repo_root = os.getcwd()
+    root = Path(repo_root).resolve()
+    out = []
+    for f in files:
+        pf = Path(f).resolve()
+        try:
+            rel = pf.relative_to(root)
+        except ValueError:
+            # 不在 root 下 ⇒ 明确报错，绝不静默写绝对路径
+            raise ValueError(
+                "文件不在 --repo-root 内，拒绝写入（避免把绝对路径塞进 git tree）：\n"
+                "  文件: %s\n  repo-root: %s\n"
+                "请用 `--repo-root <仓库根>` 指定，或用相对路径传参。" % (pf, root))
+        rel = rel.as_posix()
+        if rel.startswith("../") or rel.startswith("/"):
+            raise ValueError("换算后仍是越界路径，拒绝：%s" % rel)
+        out.append(rel)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="用 GitHub Git Data API 提交文件（git push 不通时的兜底；并发安全）")
@@ -153,6 +186,9 @@ def main():
     ap.add_argument("--verify", action="store_true", help="提交后核对远端文件大小")
     ap.add_argument("--selftest", action="store_true", help="只做环境自检并退出")
     ap.add_argument("--show", metavar="PATH", help="打印远端某个文件的内容后退出")
+    ap.add_argument("--repo-root", default=None,
+                    help="仓库根目录。文件参数将换算为相对它的仓库路径"
+                         "（★ 不换算会把绝对路径写进 git tree，见 L32）")
     ap.add_argument("--retries", type=int, default=5,
                     help="引用竞争时的重试次数（默认 5）")
     ap.add_argument("--assume-head", metavar="SHA", default=None,
@@ -203,7 +239,8 @@ def main():
             return EXIT_USAGE
 
     if args.dry_run:
-        items = [(Path(f).as_posix(), Path(f).read_bytes()) for f in args.files]
+        names = to_repo_paths(args.files, args.repo_root)
+        items = [(nm, Path(f).read_bytes()) for nm, f in zip(names, args.files)]
         total = sum(len(b) for _, b in items)
         print(f"  · 文件 {len(items)} 个，共 {total} 字节")
         print("\n[dry-run] 将执行：取 head -> 取 base tree -> 建 blob -> 建 tree -> 建 commit -> 更新 ref")
@@ -221,7 +258,8 @@ def main():
             print(f"\n--- 第 {attempt} 次尝试（引用已被他人前移，重新读取基线）---")
 
         # 每轮重新读取文件内容
-        items = [(Path(f).as_posix(), Path(f).read_bytes()) for f in args.files]
+        names = to_repo_paths(args.files, args.repo_root)
+        items = [(nm, Path(f).read_bytes()) for nm, f in zip(names, args.files)]
         if attempt == 1:
             total = sum(len(b) for _, b in items)
             print(f"  · 文件 {len(items)} 个，共 {total} 字节")
@@ -262,6 +300,10 @@ def main():
                     break
                 sha = blob["sha"]
                 blob_cache[key] = sha
+            if re.match(r"^[A-Za-z]:/", name) or name.startswith("/"):
+                print("!! 拒绝写入：tree entry 名像绝对路径（%s）。"
+                      "请用 --repo-root 指定仓库根，使路径相对化（见 L32）。" % name)
+                return EXIT_FAIL
             entries.append({"path": name, "mode": "100644", "type": "blob", "sha": sha})
         if blob_fail:
             return EXIT_FAIL

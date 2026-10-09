@@ -1033,3 +1033,244 @@ for chunk in raw.split("### FILE ")[1:]: ...
 - [ ] 工作区是从 `starter/` 复制的吗？hard_gate 必需件**都在 starter 里**吗？（L25）
 - [ ] 远端取回的证据**校验过字节数**吗？（空串 ≠ 空文件，L26）
 - [ ] 要改的是"文字"还是"判断"？改判断先问；产出填表件先确认**载体形态**（L27）
+
+---
+
+## L28 ★★★ 只跑过"我熟悉的方法族"就宣布"全部失败"，会漏掉唯一能成的那个（2026-10-07 AutoRe0565 实录）
+
+> 来源：给 `al4pde` 出题。为判断"选点策略是否是可优化的开放面"，我连续做了 **6 次**
+> 策略对照实验，全部显示"选点反而比随机更差"，于是得出"该优化面不可行、需换切入点"的结论。
+> **但我从头到尾没有跑过 `config/acquisition/` 里已经存在的三个策略：
+> `bait` / `lcmd` / `coreset_maxdist`。** 补测后发现 **`lcmd` 是唯一优于随机的方法**（−10.5%）。
+
+### 症状（不是报错，是判断错误）
+
+```
+第 1–6 次实验: power +58%(4seed) / top_k +10% / top_k +126%(小数据) /
+               max_dist 退化 / 换 PDE 后 +247% / 降预算后 +150%
+结论（当时写的）: "未找到任何能优于随机的策略 ⇒ 出题前提不成立"
+第 7 次实验（补测未测过的三个）:
+  bait           0.02130  (+12.1% 劣)
+  lcmd           0.01700  (-10.5% ★唯一优于基线)
+  coreset_maxdist  崩溃
+```
+
+### 根因
+
+**把"我测过的策略族"当成了"全部策略族"。**
+`config/acquisition/` 下实际有 9 个可用配置（`random` / `pool_random` / `power` /
+`top_k` / `max_dist` / `coreset_maxdist` / `lcmd` / `bait` / `data_schedule`），
+我先验地挑了 3 个"看起来像主力方法"的去测（不确定性类），失败后就归纳为"整类失败"。
+**没有做"枚举—勾选"这一步，于是把"未测"静默算进了"全败"。**
+
+### 判据（可执行，动手前 30 秒）
+
+```bash
+# 打开一个"候选改动空间"目录时，先把可用配置全部列出并逐条勾选状态
+ls config/acquisition/*.yaml            # 或对应的策略/模型/损失注册表
+# 对每一个写: 已测(结果) / 未测 / 不可用(原因)
+# ★ 只要还有"未测"，就不允许写出"某类方法全部失败"
+```
+
+**一句话规则**：**"全部失败"是一个需要清单背书的结论，不是一个可以凭印象下的结论。**
+
+### 可执行门禁
+
+`tools/candidate_surface_audit.py`（只读、三态退出码）：列出候选空间全部候选，
+与你的已测声明做差集，报出未声明项。
+
+```bash
+python tools/candidate_surface_audit.py --surface config/acquisition --pattern '*.yaml' \
+    --declared-inline "random,pool_random,power,top_k,max_dist"
+# ⇒ [FAIL] 存在未声明的候选 4 个: bait / coreset_maxdist / data_schedule / lcmd  (退出码 1)
+```
+
+★ 本工具在 0565 的候选空间上**真跑过一次**，输出与事故完全一致（把 `lcmd` 标为未覆盖）。
+
+### 实测代价
+
+```
+漏测三个策略 ⇒ 差点把"可做"的题判成"不可行"
+发现 lcmd 有正信号时，服务器算力（成本）已耗尽，5-seed 验证未跑完
+⇒ 最终仍未拿到合法 R 臂 ⇒ 题目无法交付
+★ 真正的损失不是"这题做不出来"，而是"我测漏了，且补救的算力已用尽"
+```
+
+---
+
+## L29 ★★★ 从训练日志里取"官方指标"必须按评测调用点去重，取错一个会静默污染全部对照（2026-10-07 AutoRe0565 实录）
+
+> 来源：`al4pde` 的 `end_of_al_iter_plots()` 每个 AL 轮会**连着打两次**评测，
+> 且两次的日志行**都以同一个键开头**（`{'al_iter': N, ...}`），肉眼与正则都分不出来。
+> 我因此一度在**错误的口径上**做跨实验比较。
+
+### 症状（两次评测的日志行长得一样）
+
+```python
+# al4pde/evaluation/visualization.py:327
+prob_model.evaluate(al_iter, prob_model.val_loader, prefix="al/",     time_step_name="al_iter")   # ← 官方 val 指标
+# :330-331
+if not last:
+    eval_on_new(task, prob_model, al_iter)        # → al4pde/evaluation/analysis.py:132
+    # prob_model.evaluate(al_iter, data_loader,  prefix="al_new_data/", time_step_name="al_iter") # ← 新选数据的指标
+```
+
+两次输出的裸 dict 只差 `prefix`（在 wandb 里区分），**stdout 上是同一形状**：
+
+```
+{'al_iter': 0, 'loss_avg': tensor(...), ..., 'nRMSE': tensor(0.0497), ...}   # al/        ← 官方
+{'al_iter': 0, 'loss_avg': tensor(...), ..., 'nRMSE': tensor(0.0909), ...}   # al_new_data/ ← 非官方
+```
+
+**反直觉之处**：两条都带 `'al_iter': 0`，直接 grep `al_iter` 会拿到两条，
+取首/取尾会得到**不同结论**，而脚本不会报任何错。
+
+### 根因
+
+日志里**没有印出 `prefix`**，而 `time_step_name="al_iter"` 对两次调用是同一个值。
+⇒ 键名不足以区分，只能靠**调用顺序**区分。
+
+### 判据 + 修法
+
+```bash
+# 1) 先确认该 runner 每个 al_iter 打几次评测、顺序如何
+grep -n "evaluate(" <runner.py> <evaluation/*.py>
+# 2) 官方口径 = 每个 al_iter 的【第一个】评测（val）；末轮因 `if not last` 只有一个
+#    用 Python 按 al_iter 分组取首个，而不是 tail -1
+grep -E "^\{'al_iter':" run.log | \
+  sed -E "s/.*'al_iter': ([0-9]+).*'nRMSE': tensor\(([0-9.eE+-]+).*/\1:\2/" | sort -t: -k1,1n -u
+```
+
+```python
+# 推荐：分组取首个
+first = {}
+for line in log.splitlines():
+    if not line.startswith("{'al_iter':"): continue
+    k = int(re.search(r"'al_iter':\s*(\d+)", line).group(1))
+    v = float(re.search(r"'nRMSE':\s*tensor\(\s*([0-9.eE+-]+)", line).group(1))
+    first.setdefault(k, v)          # ★ 只留第一个
+```
+
+**交叉验证法（必须做一次）**：用 SOP V09 的独立重载脚本，**只喂 val_loader** 复评一个
+已知 checkpoint，若复现值 == 日志里按上述规则取的终值（本例 `0.0153 == 0.0153`，
+rel_diff 0.000%），说明口径取对了。**这一步把"口径正确"从假设变成证据。**
+
+### 实测规模
+
+```
+误取会导致的偏差（同一 run、同一次训练）:
+  al_iter0 官方 0.0497 vs 非官方 0.0909     (差 83%)
+  al_iter1 官方 0.0295 vs 非官方 0.0324
+★ 取错口径，7 次跨实验对照的结论会整体不可信，且不会触发任何报错
+```
+
+---
+
+## L30 ★★ 仓库里"存在但从未端到端跑过"的配置是批量雷区：静态存在 ≠ 可用（2026-10-07 AutoRe0565 实录）
+
+> 来源：`al4pde` 依赖一个仓库自带的评测配置体系。有两个配置**写得像模像样、
+> 有完整注释、被文档引用**，但**从来没被跑通过**——它们一遇真实数据就崩。
+> 教训：把"仓库里有这个配置"当成"这条路径可用"，会让排期与选题判断整体失真。
+
+### 症状（原文照抄）
+
+```
+# 配置 A：ufull.yaml（"全量数据上界"专用调度，注释详尽、被 SKILL 引用）
+RuntimeError: torch.cat(): expected a non-empty list of Tensors
+  at al4pde/acquisition/batch_selection.py:61  ic_params = torch.cat(ic_params, dim=0)
+  ── 触发条件：FixedSchedule(batch_num_per_iter=[0, 0]) ⇒ 每轮新增 0 个点，
+     但 generate() 仍被调用 ⇒ 空选择列表 ⇒ torch.cat 崩溃
+
+# 配置 B：coreset_maxdist.yaml
+TypeError: expected Tensor as element 0 in argument 0, but got list
+  ── 触发条件：use_latent_space: true 这条 latent 分支有代码缺陷
+```
+
+### 根因
+
+这两个配置**从来没有被任何一次真实运行覆盖过**：它们的存在只是"作者写下了配置"。
+`batch_selection.generate()` 没有对"空选择"做防御；
+`use_latent_space=true` 分支的类型契约与调用方不一致。
+**注释越详尽越有欺骗性**——注释描述的是作者意图，不是实际行为。
+
+### 判据（把它变成一次 60 秒的 smoke）
+
+```bash
+# 对每一个"打算依赖"的仓库配置，先做最小化合成 + 单步运行，而不是只读 YAML
+python -m <runner> --cfg job --resolve <你的 overrides>       # 1) 配置能否合成
+# 2) 用最小规模真跑一遍（epochs=1~2, iter=1, pool 调小）
+# 3) 看退出码 + 关键阶段痕迹（selection / simulate / eval）是否都出现
+```
+
+**一句话规则**：**依赖一个仓库配置之前，先让它跑出过一次退出码 0；注释不算证据。**
+
+### 实测代价
+
+```
+ufull.yaml: 4 个 seed 全部 "AL Crashed"，才发现从未跑通 ⇒ 用来定锚点 U 的计划落空
+coreset:   一个完整 run（约 1.5h）跑到 80 epoch 时崩溃，白费
+★ 二者都不是"难实现"，是"没人跑过" —— 属于最廉价可拦的一类损失
+
+---
+
+## L31 ★★ `subprocess(text=True)` 不写 `encoding` ⇒ Windows 上按 cp936 解码 UTF-8，异常被吞后误报环境不通（2026-10-07 本仓库自身实录）
+
+> 来源：用 `tools/push_via_api.py --selftest` 自检时，工具报 **"gh 未登录或凭据失效"**，
+> 但 `gh auth status` 手工执行明明显示已登录。定位后发现是**同一个 bug** 把真实异常吞掉了。
+
+### 症状（工具报的是"环境问题"，真因是解码）
+
+```
+$ python tools/push_via_api.py --repo baimocn/autoresearch-sop --branch master --selftest
+  !! gh 未登录或凭据失效 —— 请先 `gh auth login`
+（但 `gh auth status` 手工跑：✓ Logged in to github.com account baimocn）
+```
+
+真实异常被 `except` 吞掉，若不打日志实际抛出的是：
+
+```
+UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 15: illegal multibyte sequence
+  File ".../subprocess.py", line 1614, in _readerthread
+    buffer.append(fh.read())
+```
+
+### 根因
+
+```python
+# 出错写法（push_via_api.py 原第 104 行）
+p = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+#                                                                 ^^^^^^^^^ 缺 encoding
+```
+
+`text=True` 只开启"文本模式"，编码取 **`locale.getpreferredencoding()`**。
+本机实测 `cp936`（GBK）；而 `gh` 输出含 UTF-8 的 `✓`（字节 `\xe2\x9c\x93`）
+⇒ GBK 解不出来 ⇒ 读线程抛 `UnicodeDecodeError` ⇒ 因 returncode 不可达/被捕获，
+判定落到"未登录"分支 ⇒ **误报环境不通**。
+
+**关键点**：文件里**另一个** `subprocess.run(..., text=True, encoding="utf-8")`（第 86 行）
+写对了 —— **同一个文件里两种写法并存，只有漏写的那处会炸**。
+
+### 判据 + 修法（一条 grep 全扫）
+
+```bash
+# 找出所有 text=True 但没有同段 encoding 的调用点
+grep -rn "text=True\|universal_newlines=True" --include="*.py" tools/ scripts/ \
+  | grep -v "encoding=" | grep -v "errors="
+```
+
+```python
+# 修法：凡 text=True 必配 encoding + errors（防御性）
+subprocess.run(cmd, capture_output=True, text=True,
+               encoding="utf-8", errors="replace")
+```
+
+**配套纪律**：**工具自检的失败分支不能只说"某某不通"，必须打印原始异常（或 `repr(stderr)`）**——
+本例把"编码 bug"伪装成"凭据问题"，会把人引到完全错误的排查方向。
+
+### 实测数字
+
+```
+修复前：push_via_api.py --selftest → 退出码 2、误报"gh 未登录"
+修复后：同一命令 → 退出码 0、"OK gh 已登录 / OK 仓库可达"
+本机 locale.getpreferredencoding() = cp936；gh 输出首字节观测 = b'github.com\n  \xe2\x9c\x93 ...'
+```
