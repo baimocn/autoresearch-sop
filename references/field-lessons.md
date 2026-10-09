@@ -467,6 +467,181 @@ python -c "import json;d=json.load(open('run_meta.json'));print(d.get('checkpoin
 
 ---
 
+## L19 ★★★ task.toml 必须先过“原生契约预检”再送检（2026-10-09 auto2001 实录）
+
+> 来源：auto2001 原生 NOP 轮。`harbor run --path ./harbor_task --agent nop` 任务根本起不来；
+> 改用该版本自带的 `TaskConfig` 加载，一次报出 3 个 schema 错误，另有 1 项默认值不足会土建筑阶段超时。
+
+### 症状（原文照拄）
+
+```
+3 validation errors for TaskConfig
+task.name
+  Field required [type=missing, input_value={'title': '...', 'version': '1.0.0'}, input_type=dict]
+verifier.network_mode
+  Input should be 'no-network', 'public' or 'allowlist' [type=enum, input_value='none', input_type=str]
+agent.network_mode
+  Input should be 'no-network', 'public' or 'allowlist' [type=enum, input_value='none', input_type=str]
+```
+
+同一份包在 CLI 层的报错是 `Either datasets or tasks must be provided`（缺 `[task].name` 的后果）——
+**极易被误判成“命令行用法问题”而去折腾参数**，真实原因是清单字段不合法。
+
+第 4 项不报错但同样阻断：`[environment] build_timeout_sec` 缺省 = 600s，
+而含 torch 的镜像**首次构建实测 1578s（约 26 分钟）**，最终以
+`Environment start timed out after 600.0 seconds` 收场。
+
+### 根因
+
+- `[task].name` 在目标版本里是**必填**；教程示例片段不含它，照抄必缺。
+- `network_mode` 是**枚举**（`no-network` / `public` / `allowlist`），历史稿里的 `"none"` 是常见误写。
+- `build_timeout_sec` 默认值与“装 torch 要多久”无关，必须显式声明。
+
+### 修法（可复制）
+
+```bash
+python tools/harbor_task_contract.py --task <harbor_task 目录>
+# exit 0=通过 / 1=硬失败（原生必挂）/ 2=需人工确认
+```
+
+- 补 `[task] name = "<owner>/<slug>"`。
+- 两处 `network_mode` 一律写合法枚举（本流程固定 `"no-network"`）。
+- 显式写 `[environment] build_timeout_sec = 3600`（≥ 实测 1578s 且留余量）。
+
+### 判据：用目标版本真加载，而不是“TOML 能解析”
+
+```python
+import tomllib
+from harbor.models.task.config import TaskConfig          # 目标 Harbor 版本
+TaskConfig.model_validate(tomllib.load(open(path, "rb"))) # 不抛异常才算过
+```
+
+修复前后实测：旧版 → 工具 exit 1（原样回放 3 个 schema 错误）；修复版 → exit 0（原生加载 pass）。
+**“能解析”与“原生接受”是两件事。**
+
+---
+
+## L20 ★★★ 交付物一旦被质检锚定就不许再改；更不许“改完自查通过”（2026-10-09 auto2001 实录）
+
+> 来源：auto2001 原生 NOP 轮。质检自查（H01–H06 全通过）之后，又改了
+> `workspace/harbor_task/task.toml` 三行以修掉 L19 的缺陷，然后重新打包、重新自查、报告 PASS。
+> 审阅方一句“跑完双轨不能动了”点破了问题。
+
+### 症状
+
+- 质检结论按**被检对象的 SHA-256** 锚定；对象一变，锚点即失效。
+- 表面“新包也 PASS”，实际是**自己给自己发合格证**——旧结论失效这件事没人声明。
+
+### 根因
+
+把“把东西修好”和“让结论有效”混为一谈。修好只解决技术缺陷，**不解决证据链**：
+审阅者拿旧哈希的报告去核新包，第一步就对不上。
+
+### 修法（二选一，没有第三条）
+
+1. **送检前发现** → 修完再送检（同步更新所有引用旧哈希的字段）。
+2. **送检后才发现** → 走返修：**主动上报**“哪个文件、旧哈希→新哈希、原因、其余证据未动”，
+   由平台按新哈希重跑/复核；**不得自行宣布通过**。
+
+配套动作（防“改了没登记”）：对原始文件建**基线清单（path → sha256）**，把有意改动写进清单的
+`intentional_changes`（旧值→新值→原因→证据），改完跑只读校验器，**未登记改动数必须为 0**。
+
+实测口径：返修后核对 **156 个原始文件**，出现 **23 个内容变化**，其中只有 **1 个**（task.toml）
+在本轮登记，**22 个是上一轮补证产物却从未登记** ⇒ 审阅者无法区分“有意改动”与“意外损坏”。
+
+**单次观察，待复验。**
+
+---
+
+## L21 ★★ 拉不下来的基础镜像：用官方二进制重建“等价镜像”并按内容寻址名预置（2026-10-09 auto2001 实录）
+
+> 来源：auto2001 原生 NOP 轮。题包声明 `no-network` ⇒ Harbor 需要 egress 控制边车，
+> 其基础镜像固定为 `gogost/gost:3.2.7-nightly.20260602@sha256:afc0137758ab…`；
+> 本机 Docker Hub 与试过的 6 个镜像源全部不可达，而 **GitHub 可达**。
+
+### 症状（原文照拄）
+
+```
+failed to copy: httpReadSeeker: failed open: failed to do request:
+Get "https://mirror.ccs.tencentyun.com/v2/gogost/gost/blobs/sha256:8c78889592b1658885fb6eb574701c21539e28bcfea8c8e9ebbb3dee38c9fe36?ns=docker.io":
+dial tcp: lookup mirror.ccs.tencentyun.com on 10.255.255.254:53: no such host
+```
+
+其余源：白名单 403（daocloud）、`read: connection reset by peer`（1ms.run）。
+
+### 根因
+
+边车镜像名是**内容寻址**的：Harbor 对 Dockerfile+构建上下文算
+`blake2b(digest_size=8)`（`harbor.utils.container_cache.docker_build_context_hash`），
+拼成 `harbor-prebuilt:harbor-docker-egress-control-sidecar--<hash>`；
+构建前先 `docker image inspect`，**命中即跳过构建**。所以只要把等价镜像打上同一个名字，
+Harbor 就会直接复用——不需要访问 Docker Hub。
+
+### 修法（四步，均已实测）
+
+1. **用 Harbor 自己的函数算出它期望的镜像名**（不要手拼）：
+   `docker_build_context_hash(context=<sidecar 目录>, dockerfile_path=<...>/Dockerfile, build_args={}, platform='linux/amd64')`
+   得到 `harbor-prebuilt:harbor-docker-egress-control-sidecar--<hash>`。
+2. **用官方发布二进制补齐基础镜像里的工具**：`go-gost/gost` 的 GitHub release（实测 3.2.6 stable 可取，9679136 B / 4.7s）。
+3. **按原 Dockerfile 的结构重建等价镜像**（实测：alpine + nftables + gost + 原冠脚本，35MB / 内容 14.3MB），打上第 1 步算出的名字。
+4. **真实验证策略生效**（不能只看“构建成功”）：`command -v wget 不在也行，但必须看到 `Network unreachable`）。
+
+```bash
+# 阶段验证：建一个同网络的临时容器，确认出口真被拦
+docker run --rm --entrypoint sh <镜像> -c '\
+  /opt/egress-sidecar/entrypoint.sh & sleep 4; \
+  network-policy show; \
+  wget -q -O- http://example.com || echo UNREACHABLE'
+```
+
+实测结果：`network-policy show` 输出 `mode: controlled egress`；
+`wget` 报 `Network unreachable`；而 DNS 仍可解析（设计如此）。
+
+**边界**：该做法只修复本地基础设施，**不得改动交付题包的任何字节**；
+平台侧照旧用官方镜像。
+
+**单次观察，待复验**：该技巧依赖 Harbor 实现（内容寻址命名 + inspect 命中即跳过），换 Harbor 大版本需重验。
+
+---
+
+## L22 ★★ 结构化交付文件（xlsx 类）不要用库回写；绕不开就加全表 diff 断言（2026-10-09 auto2001 实录）
+
+> 来源：auto2001 出题表格改动轮。用 openpyxl 打开、改 7 个单元格、整表 `save`，
+> 结果把同表**其他题目的行**一起改坏了，而且脚本不报错。
+
+### 症状（结构损伤完全静默：脚本退出码 0，文件能打开）
+
+| 类型 | 改前 | 改后 |
+|---|---|---|
+| 日期格式 | `datetime` + `yyyy-MM-dd HH:mm` | 裸浮点（如 `46299.6105208333`）+ `General` |
+| 超链接公式 | `=HYPERLINK("...","...")` | 被包成 `ArrayFormula` |
+| 列宽 | 19 | 13 |
+
+**发现方式（也是最好的自检）**：把“我实际改的列”与“文件实际变化的列”做差集——
+本例中实际变化的 4 列（D/J/R/AK）**全不是**我想改的列，这一反常即是证据。
+
+### 根因
+
+openpyxl 的 round-trip 没有保留全部 OOXML 语义：它只保留自己建模过的部分，
+未建模的属性（日期序列值、数字格式、列宽、ArrayFormula 包装）在回写时被重算成默认值。
+不是下载/版本问题，而是**库不声明的信息丢失**。
+
+### 修法
+
+首选：**人工粘贴**。交付改动报告，格式 = “列名 + 该列**完整新内容**”，由出题人/质检员直接整格替换；
+这样不引入任何库风险，且内容可逐行审阅。
+
+不得已而用库改时，加三道防护：
+
+1. **改前先备份**（带日期）；
+2. **改后立即回读**目标单元格，确认写入生效（防“保存不等于落盘”，参见 L15）；
+3. **全表 diff 断言**：逐单元格比对备份与新版，断言差异集 **恰等于**意图修改集（列 × 行）。
+   超出一个就停下、从备份重来。本例正是这一步抳回了“改坏别人行”。
+
+**单次观察，待复验**。
+
+---
+
 ---
 
 ## 快速检查清单（P0/P1 阶段强制过）
@@ -484,4 +659,7 @@ python -c "import json;d=json.load(open('run_meta.json'));print(d.get('checkpoin
 - [ ] 清理前先列"必须保留"清单并验证存在了吗？（L16）
 - [ ] 方法含集成/多模型时，`model.pt` 契约**覆盖全部成员**了吗？（只 save `models[0]` ⇒ 可信复算必然失分）（L17）
 - [ ] 取回的权重/源码做过 **sha256 对账**了吗？（同名≠同版本，L18）
+- [ ] 送检前用目标版本 `TaskConfig` **真加载**过 task.toml 吗？（四项契约，L19）
+- [ ] 改过被质检锚定的交付物吗？改了就**上报重检**，别自查通过（L20）
+- [ ] 结构化表格是人工改的、还是库回写的？回写后做过**全表 diff 断言**吗？（L22）
 - [ ] 要执行候选代码时，隔离沙盒建不起来**判基础设施故障**且**不回落宿主**吗？构建期做了 fail-closed 自检吗？（见 [隔离执行沙盒](references/sandbox-isolation.md)）

@@ -264,6 +264,28 @@ TOML 在 `[verifier]` 后写 `artifacts` 会归属该表，而不是顶层。仅
 
 资源预算分别配置 Agent 与 Verifier；Build/Setup/Agent/Verifier 超时、单次运行预算不是同一个值。示例 16 CPU、64GB、1 GPU、10MiB 不是每题固定要求；S3 给出的通用资源边界为 CPU ≤64C、单 Job 默认 ≤8 GPU，优先 H20/L20，最终以任务卡和审批口径复核。
 
+**补充（2026-10-09 auto2001）：四项会阻断原生运行的契约（送检前必过，见 L19）**
+
+1. `[task].name` **必填**（`<owner>/<slug>`）。缺它时 CLI 报 `Either datasets or tasks must be provided`，
+   容易被误当作命令行用法问题。
+2. `network_mode` 是**枚举**：仅 `no-network` / `public` / `allowlist`；`"none"` 会报 `Input should be 'no-network', 'public' or 'allowlist'`。
+3. `[verifier].environment_mode = "separate"` 必须显式声明。
+4. `[environment] build_timeout_sec` 必须显式声明：默认 600s，
+   而含 torch 的镜像**首次构建实测 1578s**，会报 `Environment start timed out after 600.0 seconds`。
+
+判定器（只读，三态退出码）：
+
+```bash
+python tools/harbor_task_contract.py --task <harbor_task 目录>
+# 0=通过 / 1=原生必挂 / 2=需人工确认
+```
+
+本机装了目标 Harbor 时会用其 `TaskConfig` **真加载**（最权威）；
+否则退回内置判据。**“TOML 能解析”不等于“原生接受”。**
+
+另一条并行纪律：题包一旦送检被锚定，**不再改任何字节**；
+送检后才发现缺陷的，走返修上报，由平台按新哈希复核（L20）。
+
 ### 5.5 实现两套镜像
 
 1. Agent 镜像：固定基础镜像和依赖；从 `starter/` 分别初始化只读 `/workspace/starter`、可写 `/workspace/solution`；提供公开评分器与公开数据。

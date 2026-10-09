@@ -51,6 +51,8 @@ metadata:
 21. **取回历史产物必须哈希对账**（源自实战，见 L18）：从工作区/实例取回任何权重或源码时，产出必须带 sha256 并与包内绑定字段（`run_meta.checkpoint_sha256` 等）对账；同名文件≠同一版本，`method` 字段是最便宜的版本指纹。**报结论前先自问"这份字节凭什么是最新"**。
 22. **执行候选代码必须有隔离面，且建不起来就阻断**（源自实战，见 [隔离执行沙盒](references/sandbox-isolation.md)）：Verifier 要执行候选脚本时，必须用独立运行时根 + 降权 + seccomp + rlimit 的沙盒；**沙盒建立失败判基础设施故障（不是候选失败），绝不回落宿主执行**；镜像构建期做 fail-closed 自检（根内含重型框架或可见 /tests、/proc 即让构建失败）。边界如实声明：这是 chroot+seccomp+降权，**不是内核级强隔离**。
    判定用 `tools/replay_contract_gate.py`（只读三态：0=可复算 / 1=确定性缺陷 / 2=需人工确认）。
+23. **task.toml 先过原生契约预检再送检**（源自实战，见 L19）：用**目标 Harbor 版本**的 `TaskConfig` 真加载（能解析 ≠ 原生接受）；四项必查：`[task].name` 必填、`network_mode` 只能是 `no-network`/`public`/`allowlist`、`[verifier].environment_mode = "separate"`、显式声明 `[environment] build_timeout_sec`（默认 600s 装不下含 torch 的镜像，实测首建 1578s）。判定用 `tools/harbor_task_contract.py`（0=通过 / 1=原生必挂 / 2=需人工确认）。
+24. **被质检锚定的交付物不得再改**（源自实战，见 L20）：质检结论按被检对象的 SHA-256 锚定，改一个字节即失效。要么送检前修完，要么送检后**主动上报**（文件、旧哈希→新哈希、原因、其余证据未动）由平台按新哈希复核；**严禁改完自查通过**。对原始文件建基线清单，有意改动写进 `intentional_changes`（旧值→新值→原因→证据），**未登记改动数必须为 0**。
 
 没有真实结果时填写 `NOT_RUN`/null；全部正式要求满足才写 COMPLETE/true。格式错误、非作弊 Hard Gate、超时、资源超限、基础设施故障分开标记；Hard Gate=-1 不参与正常排序。合法负分用状态区分。泄露标签或评分写权限失守须返修隔离。
 
@@ -71,6 +73,7 @@ metadata:
 - 将 [检查表模板](assets/checklist.md) 复制到当前题目专家证据目录，填真实状态和路径；空模板不是已完成证据。
 - 使用 `scripts/gpu_budget.py` 离线计算用户给定的**每实例**报价、连续租期、数量与可选余量；具体参数见 GPU 参考。该工具不提供市场报价，也不下单。
 - **经验回流**：一道题做完/返修完，把可复用经验回流到统一 SOP 仓库。判据是"换一道完全不同的题，这条经验还有效吗？"；明确禁止回流一次性操作、常识、只对本题成立的结论与任何私有材料。提示词（可整段复制给任意题目会话）与提交通道见 [经验回流](references/experience-feedback.md)。
+- 使用 `tools/harbor_task_contract.py` 做 **task.toml 原生契约预检**（只读、零成本；本机装了目标 Harbor 时会**真加载** TaskConfig，否则走内置判据）：`[task].name` / `network_mode` 枚举 / `[verifier].environment_mode` / `build_timeout_sec`；退出码 0=通过 / 1=原生必挂 / 2=需人工确认。
 - 使用 `tools/nop_preflight.py` 做原生 NOP Trial 的**环境前置预检**：逐项实测 GPU 直通（并识别 snap Docker 只读命名空间等结构性失败）、nvidia runtime、buildx、compose v2、宿主容量与题面声明的落差，给出修法；退出码 0=就绪 / 1=硬前提不满足（不要开跑）/ 2=需人工确认。只读，不启动 Trial、不训练、不读私有标签。
 - 本技能不绑定某台机器或项目绝对路径，不内置原项目的大附件、模型或整套质检代码。
 - 需要项目正式 QA 时，先定位当前平台提供的 `autoresearch-task-qa`，读取其 SKILL/规则并核对入口 `--help`。来源附件的 `audit_task.py` 不支持 `--review`，`implementation_review.py` 才支持；新版本据实选择。找不到 Skill 时可按内置 SOP 做人工检查，并明确“未执行平台机检”，不能伪造报告。
