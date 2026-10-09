@@ -484,3 +484,4 @@ python -c "import json;d=json.load(open('run_meta.json'));print(d.get('checkpoin
 - [ ] 清理前先列"必须保留"清单并验证存在了吗？（L16）
 - [ ] 方法含集成/多模型时，`model.pt` 契约**覆盖全部成员**了吗？（只 save `models[0]` ⇒ 可信复算必然失分）（L17）
 - [ ] 取回的权重/源码做过 **sha256 对账**了吗？（同名≠同版本，L18）
+- [ ] 要执行候选代码时，隔离沙盒建不起来**判基础设施故障**且**不回落宿主**吗？构建期做了 fail-closed 自检吗？（见 [隔离执行沙盒](references/sandbox-isolation.md)）
