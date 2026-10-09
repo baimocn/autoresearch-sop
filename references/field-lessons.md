@@ -1274,3 +1274,88 @@ subprocess.run(cmd, capture_output=True, text=True,
 修复后：同一命令 → 退出码 0、"OK gh 已登录 / OK 仓库可达"
 本机 locale.getpreferredencoding() = cp936；gh 输出首字节观测 = b'github.com\n  \xe2\x9c\x93 ...'
 ```
+
+---
+
+## L32 ★★★ Git Data API 建树用「绝对路径」当 entry 名 ⇒ 建出幽灵子树 `D:`，提交"成功"但目标文件纹丝不动（2026-10-07 本仓库自身实录）
+
+> 来源：用本仓库 `tools/push_via_api.py` 回流 6 个文件，工具打印
+> `5/5 commit = ... -> master 已更新`、`--verify` 全部 `OK`，**退出码 0**。
+> 但用 `gh api` 独立回读发现：**6 个文件的 blob 都还是旧版**，而仓库里多出一棵
+> 名字叫 `D:` 的子树。这是本次最危险的一类失败——**静默假成功**。
+
+### 症状（工具说成功，远端没变）
+
+```
+$ python tools/push_via_api.py ... --verify
+  5/5 commit    = 3024b513  ->  master 已更新
+  OK 远端 HEAD = 3024b513 | 回流：候选空间枚举纪律 ...
+  OK SKILL.md                    本地   21269 / 远端 21269     ← 全是 OK
+  完成。
+
+# 但独立回读：
+$ gh api repos/<owner>/<repo>/git/trees/<tree>?recursive=1 --jq '.tree[].path' | head
+  D:
+  D:/Desktop/<...>/autoresearch-sop/SKILL.md      ← 我的文件跑进了这里
+  SKILL.md                                        ← 真实位置仍是旧 blob
+```
+
+git 把 Windows 盘符当成了目录名，建出一条 `D:/Desktop/.../SKILL.md` 的路径。
+`git clone` 出来会看到一个字面量目录 `D:`。
+
+### 根因
+
+```python
+# 出错写法（push_via_api.py 原第 207/225 行）
+items = [(Path(f).as_posix(), Path(f).read_bytes()) for f in args.files]
+#          ^^^^^^^^^^^^^^^^^^^^ 绝对路径直接当成了 git tree 的 entry path
+...
+entries.append({"path": name, "mode": "100644", "type": "blob", "sha": sha})
+#                      ^^^^ 传给 POST git/trees
+```
+
+`POST /git/trees` 的 `path` 必须是**仓库相对路径**；传绝对路径时 git 不报错，
+而是把它当作一条普通路径写进树。配合 `base_tree`，**真实文件继承旧 blob、
+新 blob 挂在幽灵路径下** ⇒ 看起来"提交成功"。
+
+**为什么 `--verify` 没拦住**：它用**同一个错误的名字**去查远端
+（`GET /contents/{name}`），拿到的其实是……同名的旧文件；或按错误路径查而
+"恰好"通过。**自校验与写入共享同一个 bug ⇒ 双重确认了错误。**
+
+### 判据（三条，缺一不可）
+
+```bash
+# ① 推送后不要只看工具输出，独立回读「tree 顶层」是否混进盘符/绝对路径
+gh api repos/<o>/<r>/git/trees/<tree>?recursive=1 --jq '.tree[].path' | grep -E '^[A-Za-z]:' 
+#    有输出 ⇒ 中招
+
+# ② 逐文件比对要拿「仓库相对路径」查，且比对 **blob sha**（大小相同也算不准）
+gh api repos/<o>/<r>/contents/<relative-path>?ref=<branch> --jq '.sha'   # 与本地 git hash-object 比
+
+# ③ 顶层 path 集合应等于仓库已知根条目，多出来的任何一项都要解释
+```
+
+### 修法（已改进 push_via_api.py）
+
+```bash
+# 加 --repo-root，文件路径一律换算为仓库相对路径；越界直接拒绝
+python tools/push_via_api.py --repo o/r --branch master --repo-root /path/to/repo \
+    --message-file /tmp/msg.txt repo/SKILL.md repo/tools/x.py --verify
+```
+
+代码层面的两条硬约束（已在工具内实现）：
+1. `to_repo_paths()`：把绝对路径 `relative_to(repo_root)`；**不在 root 内则抛错**，绝不静默写绝对路径。
+2. 建树前自检：`entry.path` 若匹配 `^[A-Za-z]:/` 或以 `/` 开头 ⇒ 直接 `EXIT_FAIL`。
+
+**清理遗留**：幽灵子树无法用 `sha:null` 删除（API 要求 sha 或 content）。须
+**递归取全树、显式重建顶层条目（跳过 `D:`）**，再建 commit。注意条目名是
+`D:`（带冒号），用 `p=="D"` 过滤会漏。
+
+### 实测数字
+
+```
+本次 6 文件：blobs 上传正确（ab2bca6d / 879ed2ee / 99d05fa2 …），
+             但 tree 顶层出现 `D:`，6 个真实文件 blob 全为旧值
+修复后重推：HEAD 6dbc5ef1，顶层 10 项无 `D:`，6/6 文件 size 与本地一致（21269/72020/15550/65936/6988/16668）
+★ 教训：**"退出码 0 + 自校验 OK" 不等于远端真的变了**——自校验必须用
+  独立于写入路径的口径（此处用 blob sha 与顶层 path 集合）。

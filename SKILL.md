@@ -62,6 +62,7 @@ metadata:
 31. **从训练日志取"官方指标"必须按评测调用点去重**（源自实战，见 [L29](references/field-lessons.md)）：同一个 `time_step_name` 可能对应**两次不同口径**的评测（如 `al/` 官方 val 与 `al_new_data/` 新数据），且日志行形状相同、`prefix` 不落 stdout。**官方口径 = 每个迭代的第一次评测**（末轮常因 `if not last` 只剩一次）。用"按迭代分组取首个"而非 `tail -1`；并用 V09 独立重载（只喂 val）**交叉验证一次口径**——取错不报错，会静默污染全部对照。
 32. **依赖仓库自带配置前，先让它跑出一次退出码 0**（源自实战，见 [L30](references/field-lessons.md)）：仓库里"存在、有注释、被文档引用"的配置可能**从未端到端跑过**。实测两个：`ufull.yaml`（每轮加 0 个点 ⇒ `torch.cat` 空列表 ⇒ `RuntimeError`）与 `coreset_maxdist`（latent 分支 `TypeError`）。判据：`--cfg job --resolve` 合成成功后，再用**最小规模**（epochs=1~2、iter=1、池调小）真跑一遍，确认关键阶段痕迹与退出码。**注释描述的是作者意图，不是实际行为；注释不算证据。**
 33. **`subprocess(text=True)` 必须同写 `encoding="utf-8"` + `errors`**（源自实战，见 [L31](references/field-lessons.md)）：`text=True` 只开文本模式，编码取 `locale.getpreferredencoding()`（Windows 实测 `cp936`），用它解 `gh` 等工具的 UTF-8 输出会抛 `UnicodeDecodeError`，**该异常若被吞掉就会把"编码 bug"误报成"凭据/网络不通"**。自查：`grep -rn "text=True" --include=*.py tools/ scripts/ | grep -v encoding=`。配套纪律：**自检失败分支必须打印原始异常**，不许只说"某某不通"。
+34. **API 建 git tree 时 entry 名必须是仓库相对路径**（源自实战，见 [L32](references/field-lessons.md)）：`POST /git/trees` 传绝对路径（`D:/.../SKILL.md`）**不报错**，git 会建出幽灵子树 `D:`，真实文件继承 `base_tree` 旧 blob ⇒ **提交"成功"但内容没变**。判据：推送后独立回拉 `git/trees/<tree>?recursive=1`，顶层若出现 `^[A-Za-z]:` 项即中招；逐文件核对要比 **blob sha**（不比 size）。`tools/push_via_api.py` 已加 `--repo-root` 换算 + 越界拒绝 + entry 名自检。**自校验不得与写入路径同源**——否则双重确认同一个错误。
 
 没有真实结果时填写 `NOT_RUN`/null；全部正式要求满足才写 COMPLETE/true。格式错误、非作弊 Hard Gate、超时、资源超限、基础设施故障分开标记；Hard Gate=-1 不参与正常排序。合法负分用状态区分。泄露标签或评分写权限失守须返修隔离。
 
