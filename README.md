@@ -60,6 +60,7 @@ references/
   failure-patterns.md        ★★ 跨题目失败模式（9 条题线 + 83 条事故的提炼：六类死因过滤器、
                                  ｜ Top5 根因、决策类错误清单、选题画像 2001 同构标准）
   gpu-budget.md              GPU 选型与预算（用实测报价、按分支期望报）
+  experience-feedback.md     ★ 经验回流提示词（复制给任意题目会话；含判定标准与通道）
   source-policy.md           来源与口径（规范快照）
 assets/checklist.md          制作与验证检查表（复制到题目证据目录逐项填）
 scripts/
@@ -69,6 +70,8 @@ tools/
   milestone_gate.py          ★★ 五道里程碑门禁（M1/M2 真实数据判定 → exit 0/1/2）
   nop_preflight.py           ★★ 原生 NOP 环境前置预检（GPU/runtime/buildx/compose/容量，
                                  exit 0=就绪 1=硬前提不满足 2=需人工确认）
+  push_via_api.py            ★★ Git Data API 提交兜底（git push 不通时用；含 --selftest/
+                                 --dry-run/--verify，提交后回读远端 HEAD 二次确认）
   paper_screen.py            ★ P0 静态筛查（六类死因 + 玩具四判据 + 2001 同构，零成本 30 分钟）
   feasibility_gate.py        ★ 可行性闸门（判定门是否闭合，零 GPU）
   numeric_backsolve.py       ★ 跨规模参数数值反推（零 GPU）

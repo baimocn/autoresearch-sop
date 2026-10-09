@@ -65,6 +65,7 @@ metadata:
 
 - 将 [检查表模板](assets/checklist.md) 复制到当前题目专家证据目录，填真实状态和路径；空模板不是已完成证据。
 - 使用 `scripts/gpu_budget.py` 离线计算用户给定的**每实例**报价、连续租期、数量与可选余量；具体参数见 GPU 参考。该工具不提供市场报价，也不下单。
+- **经验回流**：一道题做完/返修完，把可复用经验回流到统一 SOP 仓库。判据是"换一道完全不同的题，这条经验还有效吗？"；明确禁止回流一次性操作、常识、只对本题成立的结论与任何私有材料。提示词（可整段复制给任意题目会话）与提交通道见 [经验回流](references/experience-feedback.md)。
 - 使用 `tools/nop_preflight.py` 做原生 NOP Trial 的**环境前置预检**：逐项实测 GPU 直通（并识别 snap Docker 只读命名空间等结构性失败）、nvidia runtime、buildx、compose v2、宿主容量与题面声明的落差，给出修法；退出码 0=就绪 / 1=硬前提不满足（不要开跑）/ 2=需人工确认。只读，不启动 Trial、不训练、不读私有标签。
 - 本技能不绑定某台机器或项目绝对路径，不内置原项目的大附件、模型或整套质检代码。
 - 需要项目正式 QA 时，先定位当前平台提供的 `autoresearch-task-qa`，读取其 SKILL/规则并核对入口 `--help`。来源附件的 `audit_task.py` 不支持 `--review`，`implementation_review.py` 才支持；新版本据实选择。找不到 Skill 时可按内置 SOP 做人工检查，并明确“未执行平台机检”，不能伪造报告。
