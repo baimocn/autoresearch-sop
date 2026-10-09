@@ -579,6 +579,61 @@ NOP 不调用模型求解、不修改初始工作区；已有 Starter 会保留�
 
 缺当前版本 NOP 记录，在 S5 中 H06 与 QA17 为 fail，运行状态为 not_run；不能以“文件齐全”或“本地 pytest 通过”绕过。
 
+#### V13 补充：环境预检与通过判据（2026-10-08 实战新增，见 L11/L13）
+
+**为什么补**：NOP 的失败几乎全部来自**环境前提**，而非题包逻辑。这些前提**在跑之前几条命令就能查**，
+但没查就会把"环境问题"误判成"题包问题"，反复返工。
+
+**第一步：跑环境预检（只读，零 Trial 成本）**
+
+```bash
+python tools/nop_preflight.py --task <harbor_task 目录>     --docker-host unix:///<私有 dockerd 的 sock>        # 需要 GPU 时勿加 --no-gpu
+# exit 0 = 前提就绪；1 = 硬前提不满足（不要开跑）；2 = 需人工确认
+```
+
+预检覆盖的五项硬前提（缺一不可）：
+
+| 前提 | 典型失败原文 | 说明 |
+|---|---|---|
+| GPU 直通 | `could not select device driver "" with capabilities: [[gpu]]` / `invoking the NVIDIA Container Runtime Hook directly is not supported` | 后者的根因是 **snap 版 Docker 的只读挂载命名空间**，配置改不动，须改用宿主命名空间的私有 dockerd |
+| nvidia runtime 注册 | `docker info --format '{{json .Runtimes}}'` 只有 `runc` | 装 `nvidia-container-toolkit` 并注册 |
+| buildx | `unknown flag: --file` | Harbor 的侧车/镜像构建调用 `docker buildx build` |
+| compose v2 | `docker: 'compose' is not a docker command` | Harbor 走 compose 编排 |
+| 宿主容量 | `Range of CPUs is from 0.01 to 8.00` | 题面声明的 cpus/memory 高于宿主时，按声明设限会**直接无法启动容器** |
+
+**第二步：关于加速与容量差异的正确处理（两项都必须留痕，不得隐瞒）**
+
+- **构建超时**（`timed out after 1800`）：镜像源是同一批 wheel 的不同 CDN，
+  `torch>=2.5.1` 这类声明式约束装出的版本与二进制完全一致 ⇒ **不是"取巧"**。
+  但必须走**试验层**（如 Harbor 的 `environment.extra_docker_compose` 注入
+  `build.args.PIP_INDEX_URL`），**不改交付包字节**。
+- **容量落差**：宿主小于题面声明时，trial 层设 `cpu_enforcement_policy: ignore` /
+  `memory_enforcement_policy: ignore`，并把宿主 `nproc`/`free` 实测值与差异**写进证据**。
+  **GPU 数量、网络策略、Verifier 分离方式必须与交付题包完全一致**——差异只允许出现在"施加方式"。
+
+**第三步：通过判据（全部满足才算链路正常）**
+
+- `finished_at` 有值；`exception_info` 为空或不存在
+- `verifier_environment_mode == "separate"`
+- `verifier_result.rewards` 为有限数值，且与 `reward.txt` / `reward.json` **一致**
+- 同一次 Trial 的 `config.json`、`result.json`、日志、artifacts manifest 齐备
+- `agent_info.name == "nop"`（与 config 的 agent 名一致）
+
+**NOP 的 0 分不是失败**：典型分支是 `FORMAT_ERROR / missing prediction file`，
+`hard_gate: false` 表示**未触发非作弊硬约束**。它证明的是链路而非训练质量。
+
+**第四步：运行绑定交叉验证（回应"哈希与交付不一致"类质控意见）**
+
+运行**之前**对题包树算全量 SHA-256 清单并随证据归档（`task-tree-hashes.json`）；
+交付时对 zip 内对应文件**逐文件比对，必须全部一致**。
+没有这一步，"我跑过 NOP"只是自陈；有了它才能证明**跑的就是交付的那份字节**。
+
+**连带纪律**：交付包内任何字节改动（哪怕只是文档措辞）都会让绑定失效
+⇒ 必须重跑 NOP 并重建哈希清单。代价已实测：缓存命中时**约 35 秒**。
+
+**共享机器**：若目标机已有其他题线在跑，使用独立根目录 + 独立 dockerd + 独立镜像名，
+不碰对方的 data-root / 镜像 / 工作树。
+
 ### V14：完整质检与交付一致性
 
 先介绍优化面、Baseline 方法、Reference 方法和全部成对分数，再审 G01–G03、21 项、H01–H06、格式和运行证据。不能用“21 项通过”覆盖内容门失败。

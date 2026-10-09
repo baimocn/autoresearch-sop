@@ -147,6 +147,205 @@
 
 **关键限定**（他们说得很清楚，我也认同）：这套流程**降低返修成本，但不保证零返修**。目标是让失败尽早、边界清楚、可重放。
 
+---
+
+## L11 ★★★ 原生 NOP Trial 是"环境类"事故的重灾区（2026-10-08 auto2768 实录）
+
+> 来源：auto2768（DREAM / 图标签噪声）返修轮。此前包内只有"手工 Docker 模拟"被当成 NOP，
+> 被平台判为**不能证明原生 Harbor NOP**，触发 H06/QA17 不通过。
+> 修复后跑通原生 Trial 两次（首次 692.2s、缓存命中后 35.0s），本条只记**可复用的判断与操作**。
+
+**核心认知**：NOP 的 0 分**不是失败**，它证明的是**链路**（镜像能建、容器能起、独立 Verifier 能执行并落地 reward）。
+真正会失败的是**环境前提**，而且这些前提**在跑之前就能查**。
+
+### 环境前提清单（跑 NOP 前逐条实测，不要假设）
+
+| 前提 | 检查命令 | 典型失败 | 修法 |
+|---|---|---|---|
+| Docker 能申请 GPU | `docker run --rm --gpus all <img> nvidia-smi -L` | `invoking the NVIDIA Container Runtime Hook directly is not supported` | 见下"snap Docker 陷阱" |
+| nvidia runtime 已注册 | `docker info --format '{{json .Runtimes}}'` | 只有 `runc`，无 `nvidia` | 装 `nvidia-container-toolkit` 并在 daemon.json 注册 |
+| buildx 存在 | `docker buildx version` | `unknown flag: --file` | 装 buildx 插件到 `~/.docker/cli-plugins/` |
+| compose v2 存在 | `docker compose version` | `docker: 'compose' is not a docker command` | 装 compose v2 插件 |
+| 宿主容量 ≥ 题面声明 | `nproc`、`free -g` vs `task.toml` 的 `cpus`/`memory_mb` | `Range of CPUs is from 0.01 to 8.00` | 见下"资源施加方式" |
+| 网络可达 GitHub/PyPI | `curl -sI https://github.com` | `early EOF`、`index-pack failed` | 用 codeload tarball 或代理 |
+
+### ★ snap 版 Docker 的结构性陷阱（本项最隐蔽）
+
+**症状**：`--gpus all` 报 `invoking the NVIDIA Container Runtime Hook directly is not supported`；
+补装 toolkit 后变成 `mkdir /usr/bin/nvidia-cuda-mps-control: read-only file system`。
+
+**根因**：snap 版 Docker 的 dockerd 跑在**只读挂载命名空间**里，CDI 规范要求逐个 bind mount 宿主文件，
+被只读命名空间拒绝。这不是配置错误，是**包装方式的结构限制**。
+
+**判定**：`snap list docker` 显示 `confinement: strict` + 挂载命名空间内 `/usr` 只读 ⇒ 必然失败。
+
+**修法（已验证）**：起一个**私有 dockerd**（宿主命名空间），与 snap 版并存互不干扰：
+
+```bash
+cat > $B/daemon.json <<EOF
+{ "runtimes": { "nvidia": { "path": "/usr/bin/nvidia-container-runtime", "runtimeArgs": [] } },
+  "storage-driver": "overlay2", "log-level": "error", "default-runtime": "runc" }
+EOF
+nohup /usr/bin/dockerd --host unix:///$B/docker.sock --pidfile $B/dockerd.pid \
+  --data-root $B/docker-data --exec-root $B/docker-exec \
+  --config-file $B/daemon.json --containerd /run/containerd/containerd.sock \
+  >> $B/logs/dockerd.log 2>&1 &
+export DOCKER_HOST=unix:///$B/docker.sock
+docker run --rm --gpus all <cuda-img> nvidia-smi -L      # 必须实测通过
+```
+
+**共享机器时的隔离纪律**：若目标机已有其他题线在用（如租用机上另一道题在跑），
+必须使用**独立根目录 + 独立 dockerd + 独立镜像名**，不碰对方的 data-root / 镜像 / 工作树。
+这是可复用的做法，不是"抢机器"。
+
+### ★ 构建超时：镜像源是合法加速，不是"取巧"
+
+**症状**：`timed out after 1800`（题面声明的 `build_timeout_sec`）。根因是从官方源拉 torch 约 0.5 MB/s。
+
+**正确做法**：镜像源（清华/阿里）只是同一批 wheel 的不同 CDN，
+`torch>=2.5.1` 这类**声明式版本约束**装出的版本与二进制完全一致。
+**不要**把它当成"证据不干净"而拒绝——那是把"证据要干净"错误外推成"不能换下载源"。
+
+**关键纪律**：加速必须走**试验层**（不改交付包字节），例如 Harbor 的
+`environment.extra_docker_compose` 注入 `build.args.PIP_INDEX_URL`。
+交付包的文件哈希必须仍与运行绑定一致（见 L13）。
+
+### ★ 资源施加方式与"声明容量"的落差
+
+题面声明 `cpus=16 / memory_mb=65536`，而租用机只有 8CPU/16GB ⇒ 按声明设限会触发
+Compose 的 CPU 范围错误而**无法启动容器**。
+
+**做法**：试验层设 `cpu_enforcement_policy: ignore` / `memory_enforcement_policy: ignore`，
+**并把这一差异如实写进 evidence**（含宿主 `nproc`/`free` 实测值）。
+**不得隐瞒**：GPU 数量、网络策略、Verifier 分离方式必须与交付题包完全一致，
+差异只允许出现在"施加方式"上，且必须留痕。
+
+### ★ NOP 结果的正确解读（判据）
+
+```json
+{"status":"INVALID","failure":"FORMAT_ERROR","hard_gate":false,
+ "candidate_fault":true,"reward":0.0,
+ "detail":"missing prediction file: /workspace/solution/artifacts/<ds>/test_pred.npy"}
+```
+
+- `hard_gate: false` ⇒ 未触发 LABEL_LEAK / QUALITY_GATE 等**非作弊硬约束**，这是预期分支。
+- 该 0.0 是"没有提交物"的**正确值**，既不判失败，也不等于通过。
+- NOP 要验证的四条链路：**镜像能构建 / 容器能起 / 独立 Verifier 在 separate 模式真实执行 / reward 正确落地**。
+
+**通过判据（全部满足）**：`finished_at` 有值、`exception_info` 为空、
+`verifier_environment_mode == "separate"`、`verifier_result.rewards` 为有限数值且与
+`reward.txt`/`reward.json` 一致、同一次 Trial 的 config/result/日志/artifacts manifest 齐备。
+
+## L12 ★★★ 质检 Skill 的契约字段必须一次性对齐（21 次报错的教训）
+
+> 来源：auto2768 质检轮。同一份 review.json 撞了 **21 次 `inspection_error`**、13 种不同错误。
+
+**错误做法**：改一处 → 重跑 → 撞下一个错 → 再改。高频重复项：`QA17.remediation` **6 次**、
+`H06 requires config.json` **5 次**。
+
+**正确做法**：动手写 review.json 前，**先把校验器的约束清单一次性列全**：
+
+```bash
+# 把 validator 里所有会 raise 的字段约束抓出来，对着清单改，不靠试错
+grep -n "raise ValueError" <qa-skill>/scripts/*.py
+```
+
+**已实测的高频字段约束（照抄即可少走弯路）**：
+
+| 约束 | 说明 |
+|---|---|
+| `harbor.path_contract.profile` + `profile_basis` | 必填；profile 取 `harbor-environment-v1`（当前默认）或 `teaching-task-root-v1` |
+| `hidden_review.mode` | 必须是 `prebuilt` / `generated` / `injected`；prebuilt 还需 `asset_paths` 指向**真实非空文件** |
+| H 项 `summary` | **≤220 字符**，超出即报 "concise summary and evidence array required" |
+| 证据引用 | 必须是**文件**，不能是目录（`tests/private/` 这类目录引用会被拒） |
+| H06 证据 | 必须同一次 Trial 的 config + result + reward + 日志**全在证据列表里** |
+| G 门 | `status`、`summary`、`reason_code` **三者都非空**；fail/manual 还须 `remediation` 与 `acceptance_evidence` |
+| QA17 | 状态由 H01–H06 **聚合**得出，不能手填覆盖；其 `remediation` 在非 pass 时强制非空 |
+| overview 统计量 | 必须与 `paired_runs` **全精度**一致（脚本按 `rel_tol=1e-7` 比），写 4 位小数会被判"与逐 seed 重算不一致" |
+| `duration_hours` | 必须 ≥ `effective_seconds/3600`；**浮点边界会咬人**：`11.0036×3600 = 39612.96 < 39613` |
+| `duration_evidence` | 必须是 collector 生成的**原始候选串精确匹配**（前缀须等于 `source_path`） |
+| `risk_notes` | 必须是字符串数组 |
+
+**入口差异**：来源附件的 `audit_task.py` **不支持 `--review`**（传了也白传，报告会退回初稿状态），
+必须用 `implementation_review.py`。且**输出目录必须新鲜**（已存在会被拒）。
+
+**注意**：这些是**报告结构约束**，不是题目缺陷。撞它们不代表包有问题，但反复撞会掩盖真正该看的证据。
+
+## L13 ★★★ 运行绑定的哈希必须与交付字节交叉验证
+
+> 来源：auto2768。这是把"NOP 记录"从"一份日志"升级为"可验证证据"的关键一步。
+
+**做法**：NOP/正式 Trial 运行**之前**，对题包树算全量 SHA-256 清单并随证据归档：
+
+```
+task-tree-hashes.json  ← {"files":[{"path":"...","sha256":"..."} , ...]}
+```
+
+**验证**：交付 zip 内对应文件逐个比对，**必须逐一相同**。
+
+```python
+rec  = {e['path']: e['sha256'] for e in load('task-tree-hashes.json')['files']}
+ship = {n[len('workspace/harbor_task/'):]: sha256(read(zip, n)) for n in names if ...}
+assert rec == ship        # 逐文件一致
+```
+
+**为什么重要**：没有这一步，"我跑过 NOP"只是自陈；有了它，才能证明**跑的就是交付的那份字节**，
+而不是另一个副本。这是回应"哈希与交付文件不一致"类质控意见的唯一硬手段。
+
+**连带纪律**：任何交付包内的字节改动（哪怕只是文档措辞）都会让绑定失效，
+必须**重跑一次 NOP 并重新生成哈希清单**。代价已实测：缓存命中时**约 35 秒**（首次构建约 11.5 分钟）。
+
+## L14 ★★ 同一事实的多个声明必须对齐（U/锚点类"双真源"）
+
+> 来源：auto2768。包内对同一个上界 `U` 存在**两套互相排斥的声明**，比措辞问题严重得多。
+
+**实测**：`tests/calibration.json`（生效）写 U=75.1333；而 `expert_annotation.json`、
+`repair/protocol_decisions.json`、`专家作业说明文档.md` 三处写 U=100.0，
+且 `protocol_decisions.json` 自称 `no_post_result_upper_bound_tuning: true`。
+
+**时间线暴露真问题**：U 在正式 B/R 结果**之前**预登记为 100，在结果**之后**改为 75.1333
+⇒ 与"不得见结果后调上界"的自我声明**直接冲突**。
+
+**正确做法（已采用）**：
+1. 把生效值统一为实际使用的锚点，其余作为**明确标注的口径对照**（两种口径下归一化 0.6528 / 0.2269 均在 [0.15,0.8]）。
+2. 把 `no_post_result_upper_bound_tuning` 改为 `false`，**并写明变更发生在结果之后**。
+3. 在公开协议里明确 `U` 与"数学上限 100"是**两个不同的量**（前者是奖励锚点，后者是资格分母用的天花板）。
+
+**原则**：**宁可如实披露一次口径变更，也不要留一个自相矛盾的 `true`**。
+审阅者能接受披露过的变更，不能接受被掩盖的矛盾。
+
+## L15 ★★ 交付物消失/被覆盖的防护（快照与报告分离）
+
+> 来源：auto2768 清理轮。交付前发现**桌面上的报告与改过的表格都不在磁盘上**，
+> 只剩改动前备份，且工作目录里那份同名旧表的目标行是**另一道题**。
+
+**教训**：
+1. **交付物与工作快照分离**：交付报告不要只存在于会话结束时的隐式状态里，落盘后**立即回读校验**。
+2. **改前先备份并命名带日期**：`<原名>.backup_<YYYYMMDD>.xlsx`，且**备份不能是"损坏版"**。
+3. **同目录可能有同名异构文件**：改表前必须先确认**主键命中**（要查 `题号 == 目标` 的那一行），
+   再动手；文件名相同**不代表**是同一份数据。
+4. **报告与表格内容必须同源**：报告里的每列新值应当**直接从已写入的文件回读**，而不是从记忆重写。
+
+## L16 ★★ 磁盘清理的安全顺序（先验证，再删除）
+
+> 来源：auto2768 清理轮。D 盘 99% 满（剩 9.2G），回收约 15G。
+
+**正确顺序**：
+1. **先列出"必须保留"清单并逐一验证存在**（最终交付 zip、最终质检报告、工作树、NOP 证据）。
+2. **再按"是否含最终版本引用"筛候选**：用最终 zip 名或版本号在所有候选目录里做内容检索，
+   命中者为待核，未命中者才进删除列表。
+3. **删除前打印确认列表**（路径 + 体积），确认无 `_final`/最新版本混入。
+4. **删除后重新核对交付物**仍在。
+
+**易误判**：`du` 可能给出**陈旧的元数据**（实测把 0 文件空目录报成 412M/710M）。
+判断"是否真的释放"要用 `df` 前后对比，不要只信 `du`。
+
+**典型的中间产物**（可安全回收）：`qa_final_*` 调试副本（保留最终一个）、
+`_superseded*` 旧交付包、旧版扫描目录、旧版包的解压副本、空壳目录。
+**不可回收**：最终交付包、最终质检报告、NOP 证据、工作树、带日期的备份。
+
+---
+
 ## 快速检查清单（P0/P1 阶段强制过）
 
 - [ ] 论文的**一句话主张**写下来了吗？指标**直接测量**它吗？（L3）
@@ -155,3 +354,8 @@
 - [ ] 所有跨规模的超参都做了**数值反推**（而非按文档字面重算）吗？（L4）
 - [ ] 失败诊断按"指标 → 判定 → 标定 → 容量 → 换题"顺序走吗？（L5）
 - [ ] 资产与数据集**解耦**了吗（换题只需 1–2 天）？（L7）
+- [ ] 跑 NOP 前实测过 GPU/buildx/compose/容量/网络**五项前提**吗？（L11）
+- [ ] 交付字节与运行绑定哈希**交叉验证过**逐文件一致吗？（L13）
+- [ ] 同一事实（锚点/口径/U）在包内**只有一套生效声明**吗？变更有披露吗？（L14）
+- [ ] 写 review.json 前**一次性列全**校验器字段约束了吗？（L12）
+- [ ] 清理前先列"必须保留"清单并验证存在了吗？（L16）
