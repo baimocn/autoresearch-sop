@@ -644,6 +644,110 @@ openpyxl 的 round-trip 没有保留全部 OOXML 语义：它只保留自己建�
 
 ---
 
+## L23 ★★★ `core.autocrlf=true` + `.gitattributes(eol=lf)` 让 git 合并被永久拒绝，且伪造出 200+ 行"幻影差异"（2026-10-09 AutoRe0823 实录）
+
+> 来源：本仓库自身的维护事故。给仓库回流经验时，`git merge --ff-only origin/master`
+> **连续被拒 4 次**，报"local changes would be overwritten"，而实际上**我什么都没改**。
+> 定位与绕行方式如下；任何在 Windows 上维护该仓库、或用 `.gitattributes` 规范行尾的仓库都会踩。
+
+### 症状（原文照抄）
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+	SKILL.md
+	references/failure-patterns.md
+	references/field-lessons.md
+Please commit your changes or stash them before you merge.
+Aborting
+warning: in the working copy of 'references/failure-patterns.md', CRLF will be replaced by LF the next time Git touches it
+```
+
+**反直觉之处**：`git status` 一直把这些文件列为 ` M`（已修改），
+但我用 `diff --strip-trailing-cr <(git show HEAD:file) file` 核对，**真实差异是 0 行**。
+而且 `git checkout -- <file>`、`git stash push -- <file>` **都清不掉这个状态**。
+
+### 根因（两层叠加）
+
+1. 本机 `core.autocrlf=true`（Windows 默认习惯）⇒ 检出时把 LF 写成 CRLF；
+2. 仓库 `.gitattributes` 规定 `*.md text eol=lf`、`*.sh text eol=lf`、`*.py text eol=lf`
+   ⇒ git 认为工作树**必须**是 LF。
+
+两者互斥：**每次读取比较都会发现"内容不一致"，于是文件永远处于"已修改"状态**。
+`git checkout` 按 autocrlf 规则再写一遍 CRLF，`git stash` 把改动收走后重放又变回 CRLF ——
+所以这两个命令都没用。`git merge` 出于安全拒绝覆盖"看起来有未提交改动"的文件。
+
+**幻影差异的规模（实测）**：
+
+```
+$ git diff --stat -- SKILL.md references/failure-patterns.md
+ SKILL.md                       | 168 ++++++++++++------------
+ references/failure-patterns.md | 290 +++++++++++++++++++++--------------------
+ 2 files changed, 236 insertions(+), 222 deletions(-)
+
+$ git diff --ignore-cr-at-eol --stat -- SKILL.md references/failure-patterns.md
+ SKILL.md                       | 8 ++++++++
+ references/failure-patterns.md | 6 ++++++
+ 2 files changed, 14 insertions(+)
+```
+
+同一个文件，**普通 diff 报 236 行改动，忽略行尾后只有 14 行**（那 14 行才是真实新增）。
+`references/production-sop.md` 更夸张：普通 diff 报 1644 行，真实差异 **22 行**。
+
+### 判据（一眼识别是行尾问题而不是真改动）
+
+```bash
+# 真实差异 = 忽略行尾后的差异。若远小于普通 diff ⇒ 是行尾噪音
+diff --strip-trailing-cr <(git show "HEAD:<file>") "<file>" | grep -c "^[<>]"
+git diff --ignore-cr-at-eol --stat -- "<file>"
+```
+
+**结论口径**：`git diff --stat` 的插入/删除行数**不能**用来判断"我改了多少"，
+在 CRLF 仓库里它会放大 10–70 倍（实测 236/14、1644/22）。
+
+### 修法（按"能不能动本机 git 配置"分两种）
+
+**修法 A：先统一行尾（推荐，一次性根治）**
+
+```bash
+# 让工作树与 .gitattributes 一致：检出为 LF，不再来回转换
+git -c core.autocrlf=false checkout -- .
+# 或永久设置（本仓库场景）
+git config core.autocrlf false
+git config core.eol lf
+```
+
+**修法 B：不改配置，直接绕开本地 git 走 API 提交（本次实际采用）**
+
+本仓库已有 `tools/push_via_api.py`（走 GitHub Git Data API）。它**不读本地索引**，
+因此完全不受行尾状态影响：
+
+```bash
+# 1) 用 gh api 取远端最新内容（拿到的就是 LF 版本）
+gh api "repos/<owner>/<repo>/contents/<path>?ref=master" --jq '.content' | base64 -d > <path>
+# 2) 在本地把新内容合并进这份"远端最新版"
+# 3) 用 API 工具提交（内部是 base_tree + compare-and-swap，并发安全）
+python tools/push_via_api.py --repo <owner>/<repo> --branch master     --message-file msg.txt --verify <files...>
+```
+
+**为什么修法 B 更稳**：它把"本地 git 状态是否正确"这个前置条件整个去掉了。
+代价是**必须先取远端最新版再合并**，否则会用旧内容覆盖别人的提交 ——
+这一点在并发回流场景下尤其重要（本仓库同时有多个会话在推）。
+
+### 连带纪律
+
+1. **并发回流时，每次提交前必须重新核对远端 HEAD 与关键计数**
+   （如"规则条数""L 编号最大值"），确认自己的改动是**接续**而不是覆盖：
+   ```bash
+   gh api repos/<owner>/<repo>/commits/master --jq '.sha[0:8] + " | " + (.commit.message | split("
+")[0])'
+   gh api "repos/<owner>/<repo>/contents/SKILL.md?ref=master" --jq '.content' | base64 -d | grep -cE "^[0-9]+\. \*\*"
+   ```
+   实测本仓库在一次会话期间**被其他会话推进了 4 次**（L17→L22、规则 19→24）。
+2. **编辑器/工具写文件时必须写 LF**（与 L8 表格里"生成脚本的 CRLF"同源纪律，
+   但那条讲的是"脚本跑不动"，本条讲的是"版本控制被污染"）。
+
+---
+
 ## 快速检查清单（P0/P1 阶段强制过）
 
 - [ ] 论文的**一句话主张**写下来了吗？指标**直接测量**它吗？（L3）
@@ -659,6 +763,8 @@ openpyxl 的 round-trip 没有保留全部 OOXML 语义：它只保留自己建�
 - [ ] 清理前先列"必须保留"清单并验证存在了吗？（L16）
 - [ ] 方法含集成/多模型时，`model.pt` 契约**覆盖全部成员**了吗？（只 save `models[0]` ⇒ 可信复算必然失分）（L17）
 - [ ] 取回的权重/源码做过 **sha256 对账**了吗？（同名≠同版本，L18）
+- [ ] 提交前核对过**远端最新 HEAD 与编号**了吗？（并发回流会被覆盖，L23）
+- [ ] `git diff` 的行数是否被行尾噪音放大？（用 `--ignore-cr-at-eol` 复核，L23）
 - [ ] 送检前用目标版本 `TaskConfig` **真加载**过 task.toml 吗？（四项契约，L19）
 - [ ] 改过被质检锚定的交付物吗？改了就**上报重检**，别自查通过（L20）
 - [ ] 结构化表格是人工改的、还是库回写的？回写后做过**全表 diff 断言**吗？（L22）

@@ -53,6 +53,7 @@ metadata:
    判定用 `tools/replay_contract_gate.py`（只读三态：0=可复算 / 1=确定性缺陷 / 2=需人工确认）。
 23. **task.toml 先过原生契约预检再送检**（源自实战，见 L19）：用**目标 Harbor 版本**的 `TaskConfig` 真加载（能解析 ≠ 原生接受）；四项必查：`[task].name` 必填、`network_mode` 只能是 `no-network`/`public`/`allowlist`、`[verifier].environment_mode = "separate"`、显式声明 `[environment] build_timeout_sec`（默认 600s 装不下含 torch 的镜像，实测首建 1578s）。判定用 `tools/harbor_task_contract.py`（0=通过 / 1=原生必挂 / 2=需人工确认）。
 24. **被质检锚定的交付物不得再改**（源自实战，见 L20）：质检结论按被检对象的 SHA-256 锚定，改一个字节即失效。要么送检前修完，要么送检后**主动上报**（文件、旧哈希→新哈希、原因、其余证据未动）由平台按新哈希复核；**严禁改完自查通过**。对原始文件建基线清单，有意改动写进 `intentional_changes`（旧值→新值→原因→证据），**未登记改动数必须为 0**。
+25. **CRLF 仓库里的差异判断与提交纪律**（源自实战，见 [L23](references/field-lessons.md)）：`git diff --stat` 的行数在 `core.autocrlf=true` + `.gitattributes(eol=lf)` 的仓库里会被放大 10–70 倍（实测 236 行 vs 真实 14 行、1644 行 vs 真实 22 行）；判断真实改动必须用 `git diff --ignore-cr-at-eol`。合并被"local changes would be overwritten"反复拒绝而 `git checkout`/`git stash` 都无效时，走 `tools/push_via_api.py` （不读本地索引，不受行尾状态影响）；**并发回流每次提交前必须核对远端 HEAD 与编号续排**。
 
 没有真实结果时填写 `NOT_RUN`/null；全部正式要求满足才写 COMPLETE/true。格式错误、非作弊 Hard Gate、超时、资源超限、基础设施故障分开标记；Hard Gate=-1 不参与正常排序。合法负分用状态区分。泄露标签或评分写权限失守须返修隔离。
 
