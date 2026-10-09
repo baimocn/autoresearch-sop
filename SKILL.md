@@ -54,7 +54,7 @@ metadata:
 23. **task.toml 先过原生契约预检再送检**（源自实战，见 L19）：用**目标 Harbor 版本**的 `TaskConfig` 真加载（能解析 ≠ 原生接受）；四项必查：`[task].name` 必填、`network_mode` 只能是 `no-network`/`public`/`allowlist`、`[verifier].environment_mode = "separate"`、显式声明 `[environment] build_timeout_sec`（默认 600s 装不下含 torch 的镜像，实测首建 1578s）。判定用 `tools/harbor_task_contract.py`（0=通过 / 1=原生必挂 / 2=需人工确认）。
 24. **被质检锚定的交付物不得再改**（源自实战，见 L20）：质检结论按被检对象的 SHA-256 锚定，改一个字节即失效。要么送检前修完，要么送检后**主动上报**（文件、旧哈希→新哈希、原因、其余证据未动）由平台按新哈希复核；**严禁改完自查通过**。对原始文件建基线清单，有意改动写进 `intentional_changes`（旧值→新值→原因→证据），**未登记改动数必须为 0**。
 25. **CRLF 仓库里的差异判断与提交纪律**（源自实战，见 [L23](references/field-lessons.md)）：`git diff --stat` 的行数在 `core.autocrlf=true` + `.gitattributes(eol=lf)` 的仓库里会被放大 10–70 倍（实测 236 行 vs 真实 14 行、1644 行 vs 真实 22 行）；判断真实改动必须用 `git diff --ignore-cr-at-eol`。合并被"local changes would be overwritten"反复拒绝而 `git checkout`/`git stash` 都无效时，走 `tools/push_via_api.py` （不读本地索引，不受行尾状态影响）；**并发回流每次提交前必须核对远端 HEAD 与编号续排**。
-26. **交付前必须在真机跑通构建与评分链路**（源自实战，见 L24）：静态检查器（`docker_paths` / 包检查器）**看不见** Dockerfile 指令语义、apt 源真实内容与 pip 依赖图；实测三类缺陷（行尾双反斜杠 / 基础镜像 Python 版本与依赖闭包不匹配 / 依赖解析冲突）全部"静态全绿、真机必挂"。**任何本地绕过（如 `--no-deps`）必须回写进交付件**，并补齐它跳过的运行时依赖。
+26. **交付前必须在真机跑通构建与评分链路**（源自实战，见 L24）：静态检查器（`docker_paths` / 包检查器）**看不见** Dockerfile 指令语义、apt 源真实内容与 pip 依赖图；实测三类缺陷（行尾双反斜杠 / 基础镜像 Python 版本与依赖闭包不匹配 / 依赖解析冲突）全部"静态全绿、真机必挂"。构建前先跑 `tools/dockerfile_preflight.py`；**任何本地绕过（如 `--no-deps`）必须回写进交付件**，并补齐它跳过的运行时依赖。
 27. **工作区由模板复制 ⇒ hard_gate 必需件必须在模板内**（源自实战，见 L25）：工作区若由 `starter/` 复制而来，所有入口/hard_gate 要求的必需件都必须存在于 `starter/`；否则**任何提交都被判违规**（reward 恒为 −1，评分链路不可用）。构建后一条 `ls` 对照必需件清单。
 28. **取回证据必须校验字节数**（源自实战，见 L26）：远端/管道读取可能**静默返回空串**（实测写出 12 个 0 字节"证据"而无报错）。空串即失败；时效性证据先落盘再分析。
 29. **改动用户交付物前先分类**（源自实战，见 L27）：**"修文字"（删错别字/去重复/修语句）可自主；"改判断"（改结论/定性/口径）必须先问**；他人写明"需你定夺"处即不可碰。产出填表/交材料件前先确认**目标载体形态**（表格列号/纯文本/Word），按官方模板版式输出。
@@ -80,6 +80,7 @@ metadata:
 - **经验回流**：一道题做完/返修完，把可复用经验回流到统一 SOP 仓库。判据是"换一道完全不同的题，这条经验还有效吗？"；明确禁止回流一次性操作、常识、只对本题成立的结论与任何私有材料。提示词（可整段复制给任意题目会话）与提交通道见 [经验回流](references/experience-feedback.md)。
 - 使用 `tools/harbor_task_contract.py` 做 **task.toml 原生契约预检**（只读、零成本；本机装了目标 Harbor 时会**真加载** TaskConfig，否则走内置判据）：`[task].name` / `network_mode` 枚举 / `[verifier].environment_mode` / `build_timeout_sec`；退出码 0=通过 / 1=原生必挂 / 2=需人工确认。
 - 使用 `tools/nop_preflight.py` 做原生 NOP Trial 的**环境前置预检**：逐项实测 GPU 直通（并识别 snap Docker 只读命名空间等结构性失败）、nvidia runtime、buildx、compose v2、宿主容量与题面声明的落差，给出修法；退出码 0=就绪 / 1=硬前提不满足（不要开跑）/ 2=需人工确认。只读，不启动 Trial、不训练、不读私有标签。
+- 使用 `tools/dockerfile_preflight.py` 做 **Dockerfile 构建前静态预检**（只读、零成本）：行尾双反斜杠（`unknown instruction: -e` 的真根因）/ 基础镜像 Python 版本与要装的版本是否匹配（`ubuntu:22.04` 装不出 `python3.9`）/ `--no-deps` 的债务提醒（须补运行时依赖 + 构建期 import 自检）；退出码 0=通过 / 1=硬失败（按现有内容构建必挂）/ 2=需人工确认。**它不能替代真机构建**，只把最贵的几类提前拦下。
 - 本技能不绑定某台机器或项目绝对路径，不内置原项目的大附件、模型或整套质检代码。
 - 需要项目正式 QA 时，先定位当前平台提供的 `autoresearch-task-qa`，读取其 SKILL/规则并核对入口 `--help`。来源附件的 `audit_task.py` 不支持 `--review`，`implementation_review.py` 才支持；新版本据实选择。找不到 Skill 时可按内置 SOP 做人工检查，并明确“未执行平台机检”，不能伪造报告。
 - 入库顶会资格/在线查重属于独立选题检查，按当前项目的专门工具处理；本技能的旧难度快照不冒充服务器最新入库规则。
